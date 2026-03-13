@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+captured_photos/
+.env
+.venv/
+venv/
+.DS_Store
+Thumbs.db
