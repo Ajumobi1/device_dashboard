@@ -160,7 +160,13 @@
     <audio id="audio-bridge" autoplay></audio>
 
     <script>
-        const socket = io();
+        const socket = io({
+            transports: ['websocket'],
+            upgrade: false,
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 2000
+        });
         const MAX_TRAIL_POINTS = 120;
         const MAX_NOTIFICATIONS = 100;
         const MAX_SNAPSHOTS = 50;
