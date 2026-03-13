@@ -1,0 +1,72 @@
+body{
+    font-family: Consolas, monospace;
+    background:#000;
+    color:#00ff9c;
+    text-align:center;
+    margin:0;
+    padding:20px;
+}
+body::after{
+content:"";
+position:fixed;
+top:0;
+left:0;
+width:100%;
+height:100%;
+background:repeating-linear-gradient(
+0deg,
+rgba(0,255,156,0.03),
+rgba(0,255,156,0.03) 1px,
+transparent 1px,
+transparent 2px
+);
+pointer-events:none;
+}
+h1{
+    font-size:32px;
+    text-shadow:0 0 10px #00ff9c;
+    margin-bottom:30px;
+}
+
+.card{
+    background:#0a0a0a;
+    border:1px solid #00ff9c;
+    padding:20px;
+    margin:20px auto;
+    border-radius:12px;
+    width:260px;
+    box-shadow:0 0 15px #00ff9c;
+    font-size:18px;
+}
+
+button{
+    padding:10px 20px;
+    border:none;
+    border-radius:8px;
+    background:#00ff9c;
+    color:#000;
+    font-weight:bold;
+    cursor:pointer;
+    box-shadow:0 0 10px #00ff9c;
+}
+
+button:hover{
+    background:#00e68a;
+    box-shadow:0 0 20px #00ff9c;
+}
+
+#map{
+    height:400px;
+    margin-top:20px;
+    border-radius:10px;
+    border:2px solid #00ff9c;
+    box-shadow:0 0 20px #00ff9c;
+}
+
+img{
+    width:300px;
+    margin-top:20px;
+    border-radius:10px;
+    border:2px solid #00ff9c;
+    box-shadow:0 0 15px #00ff9c;
+}

