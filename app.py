@@ -289,7 +289,11 @@ def client():
 
 @app.route("/dashboard")
 def dashboard():
-    return render_template("dashboard.html")
+    try:
+        return render_template("dashboard.html")
+    except Exception as error:
+        app.logger.exception("Dashboard render failed: %s", error)
+        return render_template("device.html")
 
 # -----------------------
 # Device Logic & Connection
