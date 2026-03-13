@@ -1,4 +1,10 @@
-const socket = io()
+const socket = io({
+transports: ['websocket'],
+upgrade: false,
+reconnection: true,
+reconnectionAttempts: Infinity,
+reconnectionDelay: 2000
+})
 const TELEMETRY_INTERVAL_MS = 7000
 const GEO_MAX_AGE_MS = 10000
 
