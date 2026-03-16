@@ -7,6 +7,9 @@
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 
     <style>
         body {
@@ -232,9 +235,11 @@
             reconnectionDelay: 2000
         });
         const MAX_TRAIL_POINTS = 120;
+        const MAX_TRAIL_DEVICES = 80;
+        const MIN_TRAIL_DELTA = 0.0002;
         const MAX_NOTIFICATIONS = 100;
         const MAX_SNAPSHOTS = 50;
-        const FRAME_RENDER_INTERVAL_MS = 150;
+        const FRAME_RENDER_INTERVAL_MS = 100;
 
         const lastFrameRenderByDevice = {};
         const latestFrameByDevice = {};
@@ -334,8 +339,22 @@
             attribution: '© OpenStreetMap'
         }).addTo(map);
 
+        const markerCluster = L.markerClusterGroup({
+            maxClusterRadius: 40,
+            disableClusteringAtZoom: 15,
+            spiderfyOnMaxZoom: true,
+            showCoverageOnHover: false
+        });
+        map.addLayer(markerCluster);
+
         let markers = {};
         let trails = {};
+        let lastTrailPointByDevice = {};
+
+        function hasMeaningfulMovement(lastPoint, lat, lon) {
+            if (!lastPoint) return true;
+            return Math.abs(lastPoint[0] - lat) >= MIN_TRAIL_DELTA || Math.abs(lastPoint[1] - lon) >= MIN_TRAIL_DELTA;
+        }
 
         socket.on("connect", () => {
             socket.emit("join_dashboard");
@@ -382,17 +401,29 @@
                     </div>
                 `);
 
-                if (d.lat && d.lon) {
-                    if (!markers[id]) {
-                        markers[id] = L.marker([d.lat, d.lon]).addTo(map).bindPopup(id);
-                        trails[id] = L.polyline([[d.lat, d.lon]], { color: "#00ff9c", weight: 3 }).addTo(map);
-                    } else {
-                        markers[id].setLatLng([d.lat, d.lon]);
-                        trails[id].addLatLng([d.lat, d.lon]);
+                if (Number.isFinite(Number(d.lat)) && Number.isFinite(Number(d.lon))) {
+                    const lat = Number(d.lat);
+                    const lon = Number(d.lon);
 
-                        const points = trails[id].getLatLngs();
-                        if (points.length > MAX_TRAIL_POINTS) {
-                            trails[id].setLatLngs(points.slice(points.length - MAX_TRAIL_POINTS));
+                    if (!markers[id]) {
+                        markers[id] = L.marker([lat, lon]).bindPopup(id);
+                        markerCluster.addLayer(markers[id]);
+
+                        if (Object.keys(trails).length < MAX_TRAIL_DEVICES) {
+                            trails[id] = L.polyline([[lat, lon]], { color: "#00ff9c", weight: 3 }).addTo(map);
+                            lastTrailPointByDevice[id] = [lat, lon];
+                        }
+                    } else {
+                        markers[id].setLatLng([lat, lon]);
+
+                        if (trails[id] && hasMeaningfulMovement(lastTrailPointByDevice[id], lat, lon)) {
+                            trails[id].addLatLng([lat, lon]);
+                            lastTrailPointByDevice[id] = [lat, lon];
+
+                            const points = trails[id].getLatLngs();
+                            if (points.length > MAX_TRAIL_POINTS) {
+                                trails[id].setLatLngs(points.slice(points.length - MAX_TRAIL_POINTS));
+                            }
                         }
                     }
                 }
@@ -406,10 +437,11 @@
 
             Object.keys(markers).forEach((id) => {
                 if (!activeIds.has(id)) {
-                    map.removeLayer(markers[id]);
-                    map.removeLayer(trails[id]);
+                    markerCluster.removeLayer(markers[id]);
+                    if (trails[id]) map.removeLayer(trails[id]);
                     delete markers[id];
                     delete trails[id];
+                    delete lastTrailPointByDevice[id];
                     delete lastFrameRenderByDevice[id];
                     delete latestFrameByDevice[id];
                     delete mediaStatsByDevice[id];
