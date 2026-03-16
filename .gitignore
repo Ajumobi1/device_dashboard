@@ -8,3 +8,39 @@ captured_photos/
 venv/
 .DS_Store
 Thumbs.db
+
+# Python virtual environment/runtime artifacts accidentally copied to repo root
+python.exe
+pythonw.exe
+pip.exe
+pip3.exe
+pip3.14.exe
+activate
+activate.bat
+activate.fish
+deactivate.bat
+pyvenv.cfg
+entry_points.txt
+py.typed
+
+# Wheel/dist-info style metadata files
+METADATA
+WHEEL
+RECORD
+REQUESTED
+INSTALLER
+AUTHORS.txt
+LICENSE.txt
+
+# Temporary/local helper files
+aut
+jd
+lm
+xx
+style.css
+
+# Root-level bootstrap leftovers
+/Activate.ps1
+/__init__.py
+/__main__.py
+/__pip-runner__.py
