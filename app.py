@@ -42,10 +42,12 @@ dashboard_sids = set()
 DASHBOARD_BROADCAST_INTERVAL = 1.0
 TRAIL_LOG_INTERVAL_SECONDS = 15
 DASHBOARD_ROOM = "dashboard_viewers"
+STREAM_RELAY_INTERVAL_SECONDS = 0.45
 
 last_dashboard_emit = 0.0
 dashboard_emit_scheduled = False
 APP_START_TS = time.time()
+last_stream_emit_by_device = {}
 
 metrics = {
     "http_requests_total": 0,
@@ -452,6 +454,14 @@ def handle_stream(data):
     data.setdefault("device_id", get_device_id_by_sid(request.sid))
     if not data.get("device_id") or not data.get("frame"):
         return
+
+    device_id = data.get("device_id")
+    now = time.time()
+    last_emit = last_stream_emit_by_device.get(device_id, 0.0)
+    if (now - last_emit) < STREAM_RELAY_INTERVAL_SECONDS:
+        return
+
+    last_stream_emit_by_device[device_id] = now
     inc_metric("stream_frames")
     socketio.emit("render_frame", data, room=DASHBOARD_ROOM)
 
