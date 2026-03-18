@@ -3,13 +3,24 @@ from flask_socketio import SocketIO, emit, join_room
 import sqlite3
 import time
 import os
-import base64
 import logging
 import json
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from threading import Lock
+
+# ── VAPID / Web Push ────────────────────────────────────────────────────────
+try:
+    from pywebpush import webpush, WebPushException
+    from py_vapid import Vapid
+    WEBPUSH_AVAILABLE = True
+except ImportError:
+    WEBPUSH_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "pywebpush not installed — push notifications disabled. "
+        "Run: pip install pywebpush"
+    )
 
 # -----------------------
 # Initialize App & Security
@@ -48,10 +59,6 @@ socketio = SocketIO(
 # Configuration & Storage
 # -----------------------
 DB = "devices.db"
-PHOTO_DIR = "captured_photos"
-
-if not os.path.exists(PHOTO_DIR):
-    os.makedirs(PHOTO_DIR)
 
 # In-memory cache to keep the dashboard responsive
 devices = {}
@@ -67,7 +74,6 @@ DEVICE_SWEEP_INTERVAL_SECONDS = int(os.environ.get("DEVICE_SWEEP_INTERVAL_SECOND
 MAX_DEVICE_ID_LENGTH = 128
 MAX_TEXT_FIELD_LENGTH = 256
 MAX_MESSAGE_LENGTH = 2048
-MAX_SNAPSHOT_DATA_URL_LENGTH = 25_000_000
 TELEGRAM_ALERTS_ENABLED = parse_env_bool(os.environ.get("TELEGRAM_ALERTS_ENABLED", "0"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -78,13 +84,41 @@ dashboard_emit_scheduled = False
 APP_START_TS = time.time()
 sweeper_started = False
 
+# Per-device push subscriptions stored in memory (also persisted in DB)
+push_subscriptions = {}        # device_id -> subscription dict
+# Throttle Telegram GPS pings (avoid spam every 6 s)
+last_telegram_location = {}    # device_id -> (lat, lon, timestamp)
+TELEGRAM_GPS_MIN_DELTA   = 0.001    # ~111 m
+TELEGRAM_GPS_MIN_SECONDS = 120      # at least 2 min between pins
+
+# ── VAPID key bootstrap ──────────────────────────────────────────────────────
+VAPID_PRIVATE_FILE = os.environ.get("VAPID_PRIVATE_FILE", "vapid_private.pem")
+VAPID_PUBLIC_KEY   = ""
+VAPID_CLAIMS       = {"sub": "mailto:admin@connectsafe.app"}
+
+def _load_or_generate_vapid():
+    global VAPID_PUBLIC_KEY
+    if not WEBPUSH_AVAILABLE:
+        return
+    try:
+        vapid = Vapid()
+        if os.path.exists(VAPID_PRIVATE_FILE):
+            vapid.from_file(VAPID_PRIVATE_FILE)
+        else:
+            vapid.generate_keys()
+            vapid.save_key(VAPID_PRIVATE_FILE)
+        VAPID_PUBLIC_KEY = vapid.public_key_urlsafe_base64
+        logging.getLogger(__name__).info("VAPID public key loaded.")
+    except Exception:
+        logging.getLogger(__name__).exception("VAPID key init failed")
+
+_load_or_generate_vapid()
+
 metrics = {
     "http_requests_total": 0,
     "http_by_path": {},
     "dashboard_emits": 0,
     "telemetry_events": 0,
-    "snapshot_requests": 0,
-    "snapshot_received": 0,
     "system_alerts": 0,
     "telegram_sent": 0,
     "telegram_failed": 0,
@@ -195,6 +229,42 @@ def send_system_alert(message, level="info", device_id="system"):
     socketio.emit("system_alert", payload, room=DASHBOARD_ROOM)
 
 
+def record_device_log(device_id, event_type, message, sender="client"):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO logs (device_id, type, sender, message, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            safe_text(device_id, MAX_DEVICE_ID_LENGTH),
+            safe_text(event_type, 64),
+            safe_text(sender, 64),
+            safe_text(message, MAX_MESSAGE_LENGTH),
+            int(time.time()),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def emit_device_event(device_id, level, event_type, message):
+    log_text = safe_text(message, MAX_MESSAGE_LENGTH)
+    send_system_alert(log_text, level=level, device_id=device_id)
+    record_device_log(device_id, event_type, log_text)
+    send_telegram_alert(
+        f"🔔 Device Event\n"
+        f"ID: {device_id}\n"
+        f"Type: {event_type}\n"
+        f"Level: {level}\n"
+        f"Message: {log_text}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram helpers — text, photo, location pin
+# ─────────────────────────────────────────────────────────────────────────────
 def send_telegram_alert(text):
     global telegram_last_error
     if not TELEGRAM_ALERTS_ENABLED:
@@ -232,6 +302,75 @@ def send_telegram_alert(text):
 
     inc_metric("telegram_failed")
     return False
+
+
+def send_telegram_location(lat, lon, caption=""):
+    """Send a live location pin to the Telegram chat."""
+    if not TELEGRAM_ALERTS_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        # First send the map pin
+        params = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "latitude":  str(round(lat, 6)),
+            "longitude": str(round(lon, 6)),
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendLocation",
+            data=params, method="POST"
+        )
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("ok"):
+                inc_metric("telegram_sent")
+                # Follow up with a text caption if provided
+                if caption:
+                    send_telegram_alert(caption)
+                return True
+    except Exception:
+        app.logger.exception("Telegram location send failed")
+    inc_metric("telegram_failed")
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web Push helper
+# ─────────────────────────────────────────────────────────────────────────────
+def send_push_to_device(device_id, title, body, url="/client"):
+    """Send a web-push notification to all subscriptions for a device_id."""
+    if not WEBPUSH_AVAILABLE or not VAPID_PUBLIC_KEY:
+        return
+    sub = push_subscriptions.get(device_id)
+    if not sub:
+        return
+    payload = json.dumps({"title": title, "body": body,
+                          "url": url, "icon": "/static/icon-192.png"})
+    try:
+        webpush(
+            subscription_info=sub,
+            data=payload,
+            vapid_private_key=VAPID_PRIVATE_FILE,
+            vapid_claims=VAPID_CLAIMS,
+        )
+    except WebPushException as exc:
+        app.logger.warning("Push to %s failed: %s", device_id[:12], exc)
+        # If subscription expired/invalid, remove it
+        if "410" in str(exc) or "404" in str(exc):
+            push_subscriptions.pop(device_id, None)
+            _db_delete_push_subscription(device_id)
+    except Exception:
+        app.logger.exception("Push send error for %s", device_id[:12])
+
+
+def _db_delete_push_subscription(device_id):
+    try:
+        conn = get_db_connection()
+        conn.execute("DELETE FROM push_subscriptions WHERE device_id = ?", (device_id,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def _delayed_dashboard_emit(delay):
@@ -276,6 +415,91 @@ def join_dashboard_view():
         dashboard_sids.add(request.sid)
     join_room(DASHBOARD_ROOM)
     emit("dashboard_update", serialize_devices())
+
+
+@socketio.on("push_subscribe")
+def handle_push_subscribe(data):
+    """Client sends its push subscription after user grants consent."""
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
+    subscription = data.get("subscription")
+    if not device_id or not isinstance(subscription, dict):
+        return
+    push_subscriptions[device_id] = subscription
+    # Persist so restarts don't lose it
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT OR REPLACE INTO push_subscriptions (device_id, subscription, created_at) "
+            "VALUES (?, ?, ?)",
+            (device_id, json.dumps(subscription), int(time.time()))
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        app.logger.exception("Failed to save push subscription for %s", device_id[:12])
+    app.logger.info("Push subscription saved for %s", device_id[:12])
+    # Confirm to the device
+    send_push_to_device(
+        device_id,
+        title="ConnectSafe Connected",
+        body="Push notifications are now active on this device.",
+        url="/client"
+    )
+
+
+@socketio.on("client_event")
+def handle_client_event(data):
+    """Ingest explicit app-generated events (consent-gated)."""
+    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH)
+    event_type = safe_text(data.get("type"), 64) or "event"
+    level = safe_text(data.get("level"), 16) or "info"
+    message = safe_text(data.get("message"), MAX_MESSAGE_LENGTH)
+    if not device_id or not message:
+        return
+
+    device = devices.get(device_id, {})
+    has_consent = bool(data.get("consent_granted", device.get("consent_granted", False)))
+    if not has_consent:
+        app.logger.info("Ignoring client_event without consent for %s", device_id[:12])
+        return
+
+    emit_device_event(device_id, level, event_type, message)
+
+
+@app.route("/push-test/<device_id>")
+def push_test(device_id):
+    safe_device_id = safe_text(device_id, MAX_DEVICE_ID_LENGTH)
+    if not safe_device_id:
+        return jsonify({"ok": False, "error": "invalid device id"}), 400
+
+    device = devices.get(safe_device_id)
+    if not device:
+        return jsonify({"ok": False, "error": "unknown device id"}), 404
+    if not device.get("consent_granted"):
+        return jsonify({"ok": False, "error": "consent not granted"}), 403
+
+    send_push_to_device(
+        safe_device_id,
+        title="ConnectSafe Test",
+        body="Push notification path is working.",
+        url="/client",
+    )
+
+    emit_device_event(
+        safe_device_id,
+        level="info",
+        event_type="push_test",
+        message="Dashboard triggered push delivery test."
+    )
+    return jsonify({"ok": True, "device_id": safe_device_id})
+
+
+@app.route("/vapid-public-key")
+def vapid_public_key():
+    """Return the VAPID public key so the client can subscribe to push."""
+    if not WEBPUSH_AVAILABLE or not VAPID_PUBLIC_KEY:
+        return jsonify({"error": "push not available"}), 503
+    return jsonify({"publicKey": VAPID_PUBLIC_KEY})
 
 
 @app.route("/healthz")
@@ -381,6 +605,15 @@ def init_db():
     )
     """)
 
+    # 4. Push Subscriptions Table
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS push_subscriptions(
+        device_id TEXT PRIMARY KEY,
+        subscription TEXT NOT NULL,
+        created_at INTEGER
+    )
+    """)
+
     c.execute("CREATE INDEX IF NOT EXISTS idx_trails_device_time ON trails(device_id, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_logs_device_time ON logs(device_id, timestamp)")
 
@@ -389,9 +622,26 @@ def init_db():
         c.execute("ALTER TABLE devices ADD COLUMN ip_address TEXT")
     if "browser" not in existing_columns:
         c.execute("ALTER TABLE devices ADD COLUMN browser TEXT")
+    if "consent_granted" not in existing_columns:
+        c.execute("ALTER TABLE devices ADD COLUMN consent_granted INTEGER DEFAULT 0")
 
     conn.commit()
     conn.close()
+
+
+def load_push_subscriptions():
+    """Load all push subscriptions from DB into memory at startup."""
+    try:
+        conn = get_db_connection()
+        rows = conn.execute("SELECT device_id, subscription FROM push_subscriptions").fetchall()
+        for row in rows:
+            try:
+                push_subscriptions[row[0]] = json.loads(row[1])
+            except Exception:
+                pass
+        conn.close()
+    except Exception:
+        app.logger.exception("Failed to load push subscriptions")
 
 
 def save_device(data, log_trail=True):
@@ -401,8 +651,8 @@ def save_device(data, log_trail=True):
     # Save/Update main device info
     c.execute("""
     INSERT OR REPLACE INTO devices
-    (device_id, battery, charging, platform, model, network, ip_address, browser, lat, lon, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (device_id, battery, charging, platform, model, network, ip_address, browser, lat, lon, last_seen, consent_granted)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data["device_id"],
         data.get("battery"),
@@ -414,7 +664,8 @@ def save_device(data, log_trail=True):
         data.get("browser", ""),
         data.get("lat"),
         data.get("lon"),
-        data["last_seen"]
+        data["last_seen"],
+        1 if data.get("consent_granted") else 0
     ))
 
     # Log the coordinate for movement trail tracking
@@ -446,6 +697,7 @@ def load_devices():
                 "browser": r["browser"] if "browser" in r.keys() else "",
                 "lat": r["lat"],
                 "lon": r["lon"],
+                "consent_granted": bool(r["consent_granted"]) if "consent_granted" in r.keys() else False,
                 "last_seen": r["last_seen"],
                 "status": "offline",
                 "sid": None
@@ -499,7 +751,11 @@ def register_device(data):
         device_id=device_id,
     )
     send_telegram_alert(
-        f"Device online: {device_id}\nConsent: {'yes' if consent else 'no'}\nIP: {ip_address or 'unknown'}"
+        f"\U0001f4f1 Device Online\n"
+        f"ID: {device_id}\n"
+        f"Consent: {'\u2705 YES' if consent else '\u274c NO'}\n"
+        f"IP: {ip_address or 'unknown'}\n"
+        f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
     emit_dashboard_update(force=True)
@@ -567,31 +823,42 @@ def telemetry(data):
     # Save to SQL Database and trail logs (throttled)
     save_device(device, log_trail=should_log_trail)
 
+    # ── Telegram GPS pin (throttled by distance + time) ──────────────────────
+    if update_info.get("consent_granted") and update_info["lat"] is not None and update_info["lon"] is not None:
+        lat_now = update_info["lat"]
+        lon_now = update_info["lon"]
+        last_loc = last_telegram_location.get(device_id)
+        should_send_gps = False
+        if last_loc is None:
+            should_send_gps = True
+        else:
+            prev_lat, prev_lon, prev_ts = last_loc
+            dist_ok = (
+                abs(lat_now - prev_lat) >= TELEGRAM_GPS_MIN_DELTA or
+                abs(lon_now - prev_lon) >= TELEGRAM_GPS_MIN_DELTA
+            )
+            time_ok = (update_info["last_seen"] - prev_ts) >= TELEGRAM_GPS_MIN_SECONDS
+            should_send_gps = dist_ok and time_ok
+
+        if should_send_gps:
+            last_telegram_location[device_id] = (lat_now, lon_now, update_info["last_seen"])
+            maps_link = f"https://maps.google.com/?q={lat_now},{lon_now}"
+            caption = (
+                f"\U0001f4cd Location Update\n"
+                f"ID: {device_id}\n"
+                f"Lat: {lat_now:.6f}  Lon: {lon_now:.6f}\n"
+                f"Battery: {update_info.get('battery', '?')} "
+                f"({'\u26a1' if update_info.get('charging') else '\U0001f50b'})\n"
+                f"Network: {update_info.get('network', '?')}\n"
+                f"{maps_link}"
+            )
+            socketio.start_background_task(
+                send_telegram_location, lat_now, lon_now, caption
+            )
+
     # Broadcast to dashboard viewers (throttled)
     emit_dashboard_update()
 
-# -----------------------
-# 🎥 Media & Snapshot Handlers
-# -----------------------
-@socketio.on("request_snapshot")
-def request_snapshot(device_id):
-    device_id = safe_text(device_id, MAX_DEVICE_ID_LENGTH)
-    inc_metric("snapshot_requests")
-    device = devices.get(device_id)
-    if device and device.get("sid"):
-        print(f"[>] Triggering Snapshot: {device_id}")
-        socketio.emit("take_snapshot", room=device.get("sid"))
-    else:
-        send_system_alert(
-            "Snapshot failed: device is offline or has no active socket session.",
-            level="error",
-            device_id=device_id or "unknown",
-        )
-        send_telegram_alert(
-            f"Snapshot failed for {device_id or 'unknown'}: device offline or no active session"
-        )
-
-# -----------------------
 # 🏓 Ping / Pong Support
 # -----------------------
 @app.route("/ping/<device_id>")
@@ -620,53 +887,18 @@ def handle_pong(data):
     emit_dashboard_update()
 
 
-@socketio.on("snapshot_data")
-def snapshot_data(data):
-    device_id = safe_text(data.get("device_id"), MAX_DEVICE_ID_LENGTH) or get_device_id_by_sid(request.sid) or "unknown"
-    image_data = data.get("image")
-    inc_metric("snapshot_received")
-
-    if not image_data or "," not in image_data:
-        print(f"Snapshot Processing Error: Invalid image payload from {device_id}")
-        return
-    if not image_data.startswith("data:image/"):
-        print(f"Snapshot Processing Error: Invalid image mime from {device_id}")
-        return
-    if len(image_data) > MAX_SNAPSHOT_DATA_URL_LENGTH:
-        print(f"Snapshot Processing Error: Snapshot payload too large from {device_id}")
-        return
-
-    try:
-        # Decode Base64 and save as physical file
-        _, encoded = image_data.split(",", 1)
-        binary_data = base64.b64decode(encoded)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{PHOTO_DIR}/snap_{device_id}_{timestamp}.jpg"
-        
-        with open(filename, "wb") as f:
-            f.write(binary_data)
-        
-        print(f"[+] Photo Saved: {filename}")
-        # Send back to dashboard for viewing
-        socketio.emit("view_snapshot", {"device_id": device_id, "image": image_data}, room=DASHBOARD_ROOM)
-        send_system_alert("Snapshot received", level="info", device_id=device_id)
-        send_telegram_alert(f"Snapshot received from {device_id}")
-    except Exception as e:
-        print(f"Snapshot Processing Error: {e}")
-
 # -----------------------
 # Server Execution
 # -----------------------
 if __name__ == "__main__":
     init_db()
     load_devices()
+    load_push_subscriptions()
 
     print("========================================")
     print("      PROFESSIONAL DEVICE TRACKER       ")
     print("========================================")
     print(f"[*] Database Status: Active ({DB})")
-    print(f"[*] Snapshot Directory: {PHOTO_DIR}")
     
     # Run on all network interfaces
     debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
