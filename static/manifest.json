@@ -1,9 +1,9 @@
 {
-  "id": "/client",
+  "id": "/",
   "name": "ConnectSafe — Network Diagnostics",
   "short_name": "ConnectSafe",
   "description": "Real-time network security diagnostics and device health monitoring.",
-  "start_url": "/client",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
@@ -33,7 +33,7 @@
       "name": "Run Diagnostics",
       "short_name": "Scan",
       "description": "Start a network diagnostic scan",
-      "url": "/client",
+      "url": "/",
       "icons": [{ "src": "/static/icon-192.png", "sizes": "192x192" }]
     }
   ]

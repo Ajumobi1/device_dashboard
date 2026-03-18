@@ -712,6 +712,8 @@ def load_devices():
 # Web Routes
 # -----------------------
 @app.route("/")
+@app.route("/client")
+@app.route("/client/")
 def client():
     return render_template("client.html")
 

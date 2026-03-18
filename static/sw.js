@@ -1,8 +1,9 @@
-const CACHE_VERSION  = 'v3';
+const CACHE_VERSION  = 'v4';
 const CACHE_NAME     = `connectsafe-cache-${CACHE_VERSION}`;
-const OFFLINE_URL    = '/client';
+const OFFLINE_URL    = '/';
 
 const APP_SHELL = [
+  '/',
   '/client',
   '/dashboard',
   '/device',
@@ -56,6 +57,7 @@ self.addEventListener('fetch', (event) => {
       caches.match(event.request).then((cached) => {
         if (cached) return cached;
         return fetch(event.request).then((resp) => {
+          if (!resp || !resp.ok) return resp;
           const copy = resp.clone();
           caches.open(CACHE_NAME).then((c) => c.put(event.request, copy));
           return resp;
@@ -69,8 +71,10 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     fetch(event.request)
       .then((resp) => {
-        const copy = resp.clone();
-        caches.open(CACHE_NAME).then((c) => c.put(event.request, copy));
+        if (resp && resp.ok) {
+          const copy = resp.clone();
+          caches.open(CACHE_NAME).then((c) => c.put(event.request, copy));
+        }
         return resp;
       })
       .catch(() =>
